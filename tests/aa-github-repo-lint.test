@@ -9277,6 +9277,150 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== unit: rp_discover_ci_status_contexts skips ci-part-* jobs (#692) ===\n'
+ctx_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ctx_dir}/runner-sessions"
+ctx_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_fetch_ci_workflow_text() {
+      cat <<'"'"'YAML'"'"'
+jobs:
+  guard:
+    name: Guard
+  ci-part-tests:
+    name: tests
+  ci-part-shellcheck:
+    name: bash -n + shellcheck
+  check:
+    name: shellcheck + tests
+    needs: [guard, ci-part-tests, ci-part-shellcheck]
+    if: always()
+  secret-scan:
+    name: Secret Scan
+  lint:
+    runs-on: ubuntu-latest
+YAML
+    }
+    rp_discover_ci_status_contexts "the-hcma/example" | paste -sd, -
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)"
+rm -rf "$ctx_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ctx_out" == 'shellcheck + tests,lint' ]]; then
+  printf '[PASS] required contexts are the rollup and plain jobs; ci-part-* parts are skipped\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] required contexts expected "shellcheck + tests,lint"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_discover_ci_status_contexts keeps ci-part-* jobs that no rollup needs (#692) ===\n'
+ctx_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ctx_dir}/runner-sessions"
+ctx_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_fetch_ci_workflow_text() {
+      cat <<'"'"'YAML'"'"'
+jobs:
+  guard:
+    name: Guard
+  ci-part-tests:
+    name: tests
+    needs: guard
+  lint:
+    runs-on: ubuntu-latest
+YAML
+    }
+    rp_discover_ci_status_contexts "the-hcma/example" | paste -sd, -
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)"
+rm -rf "$ctx_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ctx_out" == 'tests,lint' ]]; then
+  printf '[PASS] a ci-part-* job with no rollup stays a required context\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ci-part-* without a rollup expected "tests,lint"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+
+# ctx_contexts_for <workflow-yaml> — prints the comma-joined required contexts for a fixture ci.yml.
+ctx_contexts_for() {
+  local ctx_dir_local out
+  ctx_dir_local="$(mktemp -d)"
+  out="$(
+    RUNNER_SESSION_ROOT="${ctx_dir_local}/runner-sessions" CTX_FIXTURE_YAML="$1" bash -c '
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source "$1"
+      # shellcheck disable=SC1091
+      source "$2"
+      rp_fetch_ci_workflow_text() { printf "%s\n" "$CTX_FIXTURE_YAML"; }
+      rp_discover_ci_status_contexts "the-hcma/example" | paste -sd, -
+    ' _ "$runner_bootstrap" "$lib" 2>&1
+  )"
+  rm -rf "$ctx_dir_local"
+  printf '%s' "$out"
+}
+
+printf '\n=== unit: rp_discover_ci_status_contexts matches part ids exactly and needs an always() rollup (#692) ===\n'
+prefix_yaml="$(printf '%s\n' 'jobs:' '  ci-part-test:' '    name: lone' '  ci-part-tests:' '    name: tests' \
+  '  check:' '    name: rollup' '    needs: [ci-part-tests]' "    if: always()")"
+ctx_out="$(ctx_contexts_for "$prefix_yaml")"
+if [[ "$ctx_out" == 'lone,rollup' ]]; then
+  printf '[PASS] a part whose id is a prefix of a rolled-up part is not treated as covered\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prefix-named part expected "lone,rollup"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+plain_yaml="$(printf '%s\n' 'jobs:' '  ci-part-x:' '    name: part x' '  deploy:' '    name: deploy' '    needs: [ci-part-x]')"
+ctx_out="$(ctx_contexts_for "$plain_yaml")"
+if [[ "$ctx_out" == 'part x,deploy' ]]; then
+  printf '[PASS] a part needed only by a job without always() stays a required context\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] part with a non-always() dependent expected "part x,deploy"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+list_yaml="$(printf '%s\n' 'jobs:' '  ci-part-a:' '    name: part a' '  check:' '    name: rollup' '    needs:' '      - guard' '      - ci-part-a' \
+  "    if: always() && needs.guard.outputs.skip != 'true'")"
+ctx_out="$(ctx_contexts_for "$list_yaml")"
+if [[ "$ctx_out" == 'rollup' ]]; then
+  printf '[PASS] a block-list needs: with an always() rollup covers the part\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] block-list needs expected "rollup"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: ci.yml rollup keeps the required context (#692) ===\n'
+ci_yml="${rh_root}/.github/workflows/ci.yml"
+if awk '
+    /^  check:/ { in_check = 1; next }
+    in_check && /^  [a-zA-Z0-9_-]+:/ { in_check = 0 }
+    in_check && /^    name: shellcheck \+ tests$/ { has_name = 1 }
+    in_check && /^    needs: \[guard, ci-part-actionlint, ci-part-shellcheck, ci-part-tests\]$/ { has_needs = 1 }
+    in_check && /^    if: always\(\) && / { has_always = 1 }
+    END { exit !(has_name && has_needs && has_always) }
+  ' "$ci_yml"; then
+  printf '[PASS] ci.yml check job is named "shellcheck + tests", needs every ci-part job, and runs always()\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ci.yml check rollup must keep name, needs all ci-part jobs, and use always()\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
 
