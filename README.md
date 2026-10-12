@@ -76,6 +76,11 @@ scripts/github-repo-lint --new-repo --repo OWNER/NAME
 # Every repo in the org
 scripts/github-repo-lint --all --org the-hcma --suggest
 
+# Repos are audited concurrently by default (min(cores, 4); identical report and exit status; see "Parallel audits" below)
+scripts/github-repo-lint --all --org the-hcma --compact
+# Force a serial audit
+scripts/github-repo-lint --all --org the-hcma --compact --jobs 1
+
 # Repair supported settings (+ candidate workflow stack when run from the clone)
 scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 
@@ -84,6 +89,14 @@ scripts/github-repo-lint --enforcer
 ```
 
 Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset: `scripts/check-merge-settings` (same flags, `--merge-only` behavior). Full check table: [github-repo-lint checks](#github-repo-lint-checks).
+
+#### Parallel audits (`--jobs N`)
+
+`--jobs N` audits up to N repositories at once. The default is parallel: the host core count capped at 4, because beyond that the workers only queue behind the shared pacing gate (the 100 ms call spacing, not the worker count, bounds throughput). Set `GITHUB_REPO_LINT_JOBS=N` (a positive integer; anything else is an error, like `--jobs`) to change the default for a host (for example in the systemd unit or workflow env), or pass `--jobs 1` for a serial audit. Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so the report, the failure summary and the exit status match a serial run (verified byte-identical on the real org). Differences to know about: output is not streamed (nothing prints until all workers finish), each repo's stdout is printed before its stderr, TTY-only colour hints are not applied to replayed output, and per-process caches (for example SHA lookups) are repeated per worker so API volume is somewhat higher. `--apply-fix` always runs serially, and an unwritable `TMPDIR` falls back to a serial audit. Ctrl-C or TERM stops the workers and removes the buffers. Every `gh` call the workers make passes the shared pacing gate (see "Shared GitHub API pacing" below), so the workers share one quota budget, one minimum call spacing and one rate-limit backoff instead of each pacing alone.
+
+#### Shared GitHub API pacing
+
+Every GitHub call made through `github_api_exec_with_rate_limit_retry` (all of `scripts/lib/repo-practices`, the agent-review loop, `scripts/gh-api`) first passes `github_api_pace_gate`, which coordinates every process on the host through one state directory (`~/scratch/repository-helpers/github-api-state` by default): a shared `blocked_until` that any caller's rate-limit wait raises, the last observed core quota (read from real response headers, because `GET /rate_limit` reports a wrong core figure on some accounts), a minimum spacing between call starts, and a call counter. The gate stops at a quota reserve and waits for the real reset instead of failing, and it fails open with one NOTE if the state directory or lock is unusable. The lock is `flock` where available (Linux) with an atomic `mkdir` fallback. Environment: `GITHUB_API_PACING=0` disables the gate, `GITHUB_API_STATE_DIR` relocates the state, `GITHUB_API_MIN_INTERVAL_MS` (default 100), `GITHUB_API_QUOTA_RESERVE` (default 200) and `GITHUB_API_QUOTA_TTL_S` (default 30) tune it, and `GITHUB_API_PACE_LOCK=mkdir` forces the portable lock even where `flock` exists. Calls that are not `gh api`/`gh pr` (`gh auth status`, `gh stack`) are not paced.
 
 ### Secret scanning
 

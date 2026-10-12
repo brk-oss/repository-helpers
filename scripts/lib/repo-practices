@@ -207,6 +207,12 @@ rp_merge_only=0
 rp_strict_onboarding=0
 rp_compact=0
 rp_track_failures=0
+# Empty means "auto": resolved from the host at audit time (rp_default_jobs). --jobs N overrides.
+rp_jobs=''
+# Past this the shared pacing gate (not the workers) is the bottleneck, so more cores add nothing.
+readonly rp_jobs_auto_cap=4
+rp_audit_total_fail=0
+rp_audit_workdir=""
 rp_single_repo=0
 rp_warn_count=0
 rp_current_slug=""
@@ -279,6 +285,10 @@ With no --repo: audit the current git repository when run inside a clone (origin
 otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it leftovers.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
 --compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
+--jobs N: audit up to N repositories concurrently. Default: the host core count capped at 4 (GITHUB_REPO_LINT_JOBS overrides and must be a positive integer; --jobs 1 forces a serial run). The report (including --compact), the failure summary and the
+exit status match a serial run: each repository's output is buffered and replayed in the original repo
+order. Output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker.
+Serial with --apply-fix, and when TMPDIR is not writable.
 
 Requires: gh (authenticated), jq.
 
@@ -5665,7 +5675,7 @@ rp_apply_file_pr_via_api() {
   fi
 
   set +e
-  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr list file fix" \
+  pr_url="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list file fix" \
     -- gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
       --jq '.[0].url // empty')"
   pr_list_exit_code=$?
@@ -5761,7 +5771,7 @@ rp_apply_file_pr_via_api() {
 
   pr_url=""
   set +e
-  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr create file fix" \
+  pr_url="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr create file fix" \
     -- gh pr create \
       --repo "$slug" \
       --head "$branch_name" \
@@ -6344,7 +6354,7 @@ rp_apply_candidate_fix_stack() {
   for branch in "${created_branches[@]}"; do
     branch_pr_number=''
     branch_pr_list_exit_code=0
-    branch_pr_number="$(rp_runner_exec_stdout "repo-practices gh pr list candidate stack branch" \
+    branch_pr_number="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list candidate stack branch" \
       -- gh pr list --repo "$slug" --head "$branch" --state open --json number \
         --jq '.[0].number // empty')" \
       || branch_pr_list_exit_code=$?
@@ -6375,9 +6385,9 @@ EOF
     fi
     printf '%s' "$branch_pr_body" >"$branch_pr_body_file"
     branch_pr_edit_exit_code=0
-    runner_exec "repo-practices gh pr edit candidate stack rollout notice" \
+    github_api_exec_with_rate_limit_retry "repo-practices gh pr edit candidate stack rollout notice" \
       -- gh pr edit "$branch_pr_number" --repo "$slug" --body-file "$branch_pr_body_file" \
-      || branch_pr_edit_exit_code=$?
+      >/dev/null || branch_pr_edit_exit_code=$?
     rm -f "$branch_pr_body_file"
     if (( branch_pr_edit_exit_code != 0 )); then
       rp_log_warn "${slug}: failed to set rollout-notice body on PR #${branch_pr_number} (${branch})"
@@ -6399,7 +6409,7 @@ rp_apply_codeowners_pr() {
 
   local pr_list_exit_code=0
   set +e
-  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr list codeowners" \
+  pr_url="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list codeowners" \
     -- gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
       --jq '.[0].url // empty')"
   pr_list_exit_code=$?
@@ -6449,7 +6459,7 @@ rp_apply_codeowners_pr() {
   fi
   rp_runner_gh_api_stream "repo-practices gh put codeowners" "${put_args[@]}" >/dev/null
 
-  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr create codeowners" \
+  pr_url="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr create codeowners" \
     -- gh pr create \
       --repo "$slug" \
       --head "$branch_name" \
@@ -8124,6 +8134,12 @@ rp_parse_args() {
       --all)
         rp_audit_all=1
         shift
+        ;;
+      --jobs)
+        [[ $# -ge 2 ]] || rp_die "--jobs requires a positive integer"
+        [[ "$2" =~ ^[1-9][0-9]*$ ]] || rp_die "--jobs requires a positive integer (got: $2)"
+        rp_jobs="$2"
+        shift 2
         ;;
       --include-private)
         rp_include_private=1
@@ -10540,6 +10556,237 @@ rp_check_one_repo() {
   return "$total_fail"
 }
 
+# rp_audit_record_result <slug> <exit-status>
+# Folds one repository's audit result into the report state (shared by the serial and parallel paths).
+rp_audit_record_result() {
+  local -r slug="$1"
+  local -r status="$2"
+
+  if [[ "$status" -ne 0 ]]; then
+    rp_audit_total_fail=$(( rp_audit_total_fail + 1 ))
+    if [[ "$rp_compact" -eq 1 || "$rp_track_failures" -eq 1 ]]; then
+      rp_compact_failed_repos+=("$slug")
+    fi
+  elif [[ "$rp_compact" -eq 1 ]]; then
+    rp_compact_passed_repos+=("$slug")
+  fi
+}
+
+# rp_audit_repos_serial <repo-count>
+rp_audit_repos_serial() {
+  local -r repo_count="$1"
+  local slug
+  local status
+
+  for slug in "${rp_repo_slugs[@]}"; do
+    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
+      printf '\n%s\n' "$slug" >&2
+    fi
+    rp_current_slug="$slug"
+    status=0
+    rp_check_one_repo "$slug" || status=$?
+    rp_audit_record_result "$slug" "$status"
+    rp_current_slug=""
+  done
+}
+
+# rp_audit_repo_worker <slug> <path-prefix> <worker-index>
+# Runs inside a background subshell: audits one repository with its stdout/stderr buffered to files
+# and writes the per-repo state the parent needs (exit status, warning count, compact entries).
+# `.done` is written last, so a worker that died early (rp_die/exit) is detectable.
+rp_audit_repo_worker() {
+  local -r slug="$1"
+  local -r prefix="$2"
+  local -r worker_idx="$3"
+  local status=0
+
+  # The runner keeps per-session state in one shared file (.order, read by runner_last_id), so
+  # concurrent workers must not share RUNNER_SESSION_DIR or they read each other's command results.
+  # A private sub-session under the parent's keeps artifacts and failure reports with the parent,
+  # which still owns cleanup; rp_audit_adopt_worker_session folds the records into the parent afterwards.
+  if [[ -n "${RUNNER_SESSION_DIR:-}" && -d "${RUNNER_SESSION_DIR}" ]]; then
+    RUNNER_SESSION_DIR="${RUNNER_SESSION_DIR}/worker-${worker_idx}"
+    mkdir -p -- "$RUNNER_SESSION_DIR"
+    export RUNNER_SESSION_DIR
+  fi
+  rp_current_slug="$slug"
+  rp_warn_count=0
+  rp_check_one_repo "$slug" >"${prefix}.out" 2>"${prefix}.err" || status=$?
+  printf '%s\n' "$status" >"${prefix}.status"
+  printf '%s\n' "$rp_warn_count" >"${prefix}.warn"
+  printf '%s' "${rp_compact_entries[$slug]:-}" >"${prefix}.entries"
+  : >"${prefix}.done"
+}
+
+# rp_audit_descendant_pids <pid>
+# Prints every live descendant of <pid>, children before grandchildren. A worker's active gh call
+# is a child (or, via the runner, a grandchild) that outlives the worker if only the worker is killed.
+rp_audit_descendant_pids() {
+  local child
+
+  while IFS= read -r child; do
+    [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+    printf '%s\n' "$child"
+    rp_audit_descendant_pids "$child"
+  done < <(pgrep -P "$1" 2>/dev/null || true)
+}
+
+# rp_audit_parallel_abort
+# INT/TERM handler for the parallel audit: stop the workers and their in-flight commands, and remove
+# the buffer directory so a Ctrl-C does not leave workers or gh calls running or leak the directory.
+# EXIT is deliberately not trapped: it belongs to the runner session cleanup and must keep running.
+rp_audit_parallel_abort() {
+  local pids pid descendants
+
+  trap - INT TERM
+  pids="$(jobs -p)"
+  if [[ -n "$pids" ]]; then
+    descendants=""
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+      descendants+="$(rp_audit_descendant_pids "$pid")"$'\n'
+    done <<<"$pids"
+    # shellcheck disable=SC2086  # both lists are newline-separated integers
+    kill $descendants $pids 2>/dev/null || true
+  fi
+  if [[ -n "$rp_audit_workdir" ]]; then
+    rm -rf -- "$rp_audit_workdir"
+  fi
+  printf 'ERROR: audit interrupted; stopped workers\n' >&2
+  exit 130
+}
+
+# rp_audit_adopt_worker_session <worker-index>
+# Moves a worker's runner records into the parent session, appending them to the parent's .order,
+# so failure reports built from the parent session (runner_report_append_command_failures) list
+# worker failures too. Called in repo order, so the ids land in the same order a serial run has.
+rp_audit_adopt_worker_session() {
+  local -r worker_dir="${RUNNER_SESSION_DIR:-}/worker-$1"
+  local uuid
+
+  [[ -n "${RUNNER_SESSION_DIR:-}" && -f "${worker_dir}/.order" ]] || return 0
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" && -d "${worker_dir}/${uuid}" ]] || continue
+    mv -- "${worker_dir}/${uuid}" "${RUNNER_SESSION_DIR}/${uuid}"
+    printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
+  done <"${worker_dir}/.order"
+  rm -rf -- "$worker_dir"
+}
+
+# rp_audit_repos_parallel <repo-count>
+# Audits up to rp_jobs repositories at once, then replays each repo's buffered output and folds its
+# result into the report state in the original repo order, so output and the --compact report match
+# a serial run regardless of which repo finishes first. Falls back to serial when no writable
+# TMPDIR is available for the per-repo buffers.
+rp_audit_repos_parallel() {
+  local -r repo_count="$1"
+  local workdir slug prefix idx running status warn entries
+
+  if ! workdir="$(mktemp -d 2>/dev/null)"; then
+    printf 'NOTE: --jobs needs a writable TMPDIR for per-repo buffers; auditing serially\n' >&2
+    rp_audit_repos_serial "$repo_count"
+    return 0
+  fi
+  rp_audit_workdir="$workdir"
+  trap 'rp_audit_parallel_abort' INT TERM
+  idx=0
+  running=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    while (( running >= rp_jobs )); do
+      wait -n || true
+      running=$(( running - 1 ))
+    done
+    ( rp_audit_repo_worker "$slug" "${workdir}/${idx}" "$idx" ) &
+    running=$(( running + 1 ))
+    idx=$(( idx + 1 ))
+  done
+  wait || true
+
+  idx=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    prefix="${workdir}/${idx}"
+    rp_audit_adopt_worker_session "$idx"
+    idx=$(( idx + 1 ))
+    if [[ "$rp_compact" -eq 0 ]]; then
+      printf '\n%s\n' "$slug" >&2
+    fi
+    if [[ ! -e "${prefix}.done" ]]; then
+      [[ ! -f "${prefix}.out" ]] || cat -- "${prefix}.out"
+      [[ ! -f "${prefix}.err" ]] || cat -- "${prefix}.err" >&2
+      printf 'ERROR: audit worker for %s exited before finishing\n' "$slug" >&2
+      rp_audit_record_result "$slug" 1
+      continue
+    fi
+    cat -- "${prefix}.out"
+    cat -- "${prefix}.err" >&2
+    status="$(<"${prefix}.status")"
+    warn="$(<"${prefix}.warn")"
+    entries="$(<"${prefix}.entries")"
+    rp_warn_count=$(( rp_warn_count + warn ))
+    if [[ -n "$entries" ]]; then
+      rp_compact_entries[$slug]="$entries"
+    fi
+    rp_audit_record_result "$slug" "$status"
+  done
+  trap - INT TERM
+  rm -rf -- "$workdir"
+  rp_audit_workdir=""
+}
+
+# rp_default_jobs
+# Worker count when --jobs is not given: GITHUB_REPO_LINT_JOBS (positive integer) wins, else the
+# host core count capped at rp_jobs_auto_cap, never below 1.
+rp_default_jobs() {
+  local cores='' jobs
+
+  jobs="${GITHUB_REPO_LINT_JOBS:-}"
+  if [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$jobs"
+    return 0
+  fi
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores=1
+  fi
+  if (( cores > rp_jobs_auto_cap )); then
+    cores="$rp_jobs_auto_cap"
+  fi
+  printf '%s' "$cores"
+}
+
+# rp_audit_repos <repo-count>
+# Sets rp_audit_total_fail. Parallel only for >1 repos with --jobs > 1; --apply-fix stays serial
+# because it queues candidate-fix state in shared arrays and creates worktrees per repo.
+rp_audit_repos() {
+  local -r repo_count="$1"
+  local slug
+
+  rp_audit_total_fail=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    if [[ "$slug" != */* ]]; then
+      rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
+    fi
+  done
+
+  if [[ -z "$rp_jobs" ]]; then
+    # Fail like --jobs does: a set but invalid value is an operator mistake, not a request for auto.
+    if [[ -n "${GITHUB_REPO_LINT_JOBS:-}" && ! "${GITHUB_REPO_LINT_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+      rp_die "GITHUB_REPO_LINT_JOBS requires a positive integer (got: ${GITHUB_REPO_LINT_JOBS})"
+    fi
+    rp_jobs="$(rp_default_jobs)"
+  fi
+  if [[ "$rp_jobs" -gt 1 && "$repo_count" -gt 1 && "$rp_apply_fix" -eq 0 ]]; then
+    rp_audit_repos_parallel "$repo_count"
+  else
+    rp_audit_repos_serial "$repo_count"
+  fi
+}
+
 rp_main() {
   local prog="$1"
   shift
@@ -10566,24 +10813,8 @@ rp_main() {
     rp_check_ci_shellcheck_pin
   fi
 
-  for slug in "${rp_repo_slugs[@]}"; do
-    if [[ "$slug" != */* ]]; then
-      rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
-    fi
-    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
-      printf '\n%s\n' "$slug" >&2
-    fi
-    rp_current_slug="$slug"
-    if ! rp_check_one_repo "$slug"; then
-      total_fail=$(( total_fail + 1 ))
-      if [[ "$rp_compact" -eq 1 || "$rp_track_failures" -eq 1 ]]; then
-        rp_compact_failed_repos+=("$slug")
-      fi
-    elif [[ "$rp_compact" -eq 1 ]]; then
-      rp_compact_passed_repos+=("$slug")
-    fi
-    rp_current_slug=""
-  done
+  rp_audit_repos "$repo_count"
+  total_fail="$rp_audit_total_fail"
 
   if [[ "$rp_compact" -eq 1 ]]; then
     rp_compact_print_report
