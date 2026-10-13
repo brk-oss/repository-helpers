@@ -90,6 +90,7 @@ Commands:
   reply-thread --thread-id ID --body TEXT
   reply-comment (--comment-id ID | --review-id ID) --body TEXT [--pr N] [--repo OWNER/NAME]
   resolve-comment (--comment-id ID | --review-id ID) [--pr N] [--repo OWNER/NAME] [--force]
+                 (--comment-id takes the numeric comment_id or the IC_<id> feedback_id; --review-id takes the numeric id or PRR_<id>)
   resolve-addressed [--pr N] [--repo OWNER/NAME]
   resolve-human-addressed [--pr N] [--repo OWNER/NAME]
   email-failure [--pr N] [--repo OWNER/NAME] [--reason TEXT]
@@ -820,7 +821,8 @@ cmd_resolve_addressed() {
       -r 'map(select(.state == "needs_resolve")) | .[].comment_id'
   )
   for cid in "${comment_ids[@]}"; do
-    agent_review_resolve_issue_comment "${repo}" "${pr}" "${cid}"
+    # These ids come from the same listing, so skip the per-comment existence re-fetch (5th arg).
+    agent_review_resolve_issue_comment "${repo}" "${pr}" "${cid}" 0 1
   done
   reviews_json="$(agent_review_feedback_reviews_pending_json "${repo}" "${pr}" "${snapshot}")"
   mapfile -t review_ids < <(
