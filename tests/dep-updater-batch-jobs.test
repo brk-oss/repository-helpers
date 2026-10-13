@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# Tests for dep-updater --batch --all --jobs: a parallel run must report exactly like a serial one.
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# Copies named top-level functions out of dep-updater (it runs main on source, so it cannot be sourced).
+extract_functions() {
+  local fn
+  for fn in "$@"; do
+    awk -v fn="$fn" '$0 == fn "() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script"
+  done
+}
+extract_functions \
+  batch_all_adopt_worker_session batch_all_default_jobs batch_all_descendant_pids \
+  batch_all_fold_result batch_all_now_ms batch_all_resolve_jobs batch_all_stdin_is_tty \
+  batch_all_record_timing batch_all_repo_color batch_all_write_timings \
+  batch_all_run_parallel batch_all_run_serial batch_all_stop_workers batch_all_worker_finished \
+  batch_all_worker_main >"${tmp}/functions"
+# shellcheck disable=SC2016  # written literally; the functions file is sourced by the driver shells
+printf 'source "%s"\n' "${script_dir}/../scripts/lib/time-log" >>"${tmp}/functions"
+# Stand-ins for the runner-wrapped jq helpers dep-updater defines (the tests do not load the runner).
+cat >>"${tmp}/functions" <<'STUBS'
+dep_runner_jq_file_args() { local file="$2"; shift 2; jq "$@" "$file"; }
+runner_exec_stdout() { shift 2; "$@"; }
+STUBS
+
+# Drives batch_all_run_serial/parallel with a stubbed batch_all_process_repo. Stub behaviour per repo:
+#   o/a  passes, but (when GATE=1) blocks until o/c has finished, so it completes after repos that
+#        started later: proves concurrency and out-of-order completion without any sleep.
+#   o/b  passes and leaves its ephemeral clone for follow-up.
+#   o/c  fails with exit 2, a summary and a detail line.
+#   o/d  exits early without recording a result (a dead worker) when DIE_D=1, else fails with exit 1.
+read -r -d '' driver <<'DRIVER' || true
+set -euo pipefail
+source "$1"
+jobs="$2"; results="$3"; gate_dir="$4"
+batch_all_jobs="$jobs"
+batch_all_jobs_auto_cap=4
+_batch_all_interrupted=0
+_batch_all_retained_clones=0
+_batch_all_repo_colors=()
+_batch_all_worker_pids=()
+log() { printf '%s\n' "$*" >&2; }
+dep_updater_batch_all_append_child_updates() { :; }
+batch_all_process_repo() {
+  local line="$1" prefix="$2" slug here spin=0
+  slug="${line%%$'\t'*}"
+  if [[ "${GATE:-0}" == 1 && "$slug" == o/a ]]; then
+    while [[ ! -e "${gate_dir}/c" ]]; do
+      spin=$(( spin + 1 ))
+      if (( spin > 3000000 )); then printf 'gate timeout\n' >&2; return 9; fi
+    done
+  fi
+  printf 'out:%s\n' "$slug"
+  here=yes; [[ "$BASHPID" != "$PARENT_PID" ]] || here=no
+  printf 'log:%s in_subshell=%s\n' "$slug" "$here" >&2
+  case "$slug" in
+    o/b) : >"${prefix}.retained"; printf 'b\tok\t5\n' >"${prefix}.timing" ;;
+    o/c)
+      printf '%s\n' 2 >"${prefix}.exit"
+      printf '%s\n' "c: exit 2 — boom" >"${prefix}.summary"
+      printf '%s\n' "c: detail one" >"${prefix}.details"
+      : >"${gate_dir}/c"
+      ;;
+    o/d)
+      [[ "${DIE_D:-0}" != 1 ]] || exit 7
+      printf '%s\n' 1 >"${prefix}.exit"
+      ;;
+  esac
+  : >"${prefix}.done"
+}
+PARENT_PID="$BASHPID"
+# RACE_127=1 emulates wait -n returning 127 because the last worker was already reaped.
+if [[ "${RACE_127:-0}" == 1 ]]; then wait() { if [[ "${1:-}" == -n ]]; then return 127; fi; builtin wait "$@"; }; fi
+worst_exit=0
+failure_summaries=()
+failure_details=()
+timing_rows=()
+mkdir -p "$results"
+lines=($'o/a\t/x/a' $'o/b\t/x/b' $'o/c\t/x/c' $'o/d\t/x/d')
+rc=0
+if [[ "$MODE" == parallel ]]; then
+  batch_all_run_parallel "$results" "" "${lines[@]}" || rc=$?
+else
+  batch_all_run_serial "$results" "" "${lines[@]}" || rc=$?
+fi
+printf 'RESULT rc=%s worst=%s retained=%s\n' "$rc" "$worst_exit" "$_batch_all_retained_clones"
+printf 'SUMMARY %s\n' "${failure_summaries[@]}"
+printf 'DETAIL %s\n' "${failure_details[@]}"
+printf 'TIMING_ROW %s\n' "${timing_rows[@]}"
+DRIVER
+
+# run_case <name> <mode> <jobs> [VAR=value ...]  -> $tmp/<name>.{out,err}
+run_case() {
+  local -r name="$1" mode="$2" jobs="$3"
+  shift 3
+  mkdir -p "${tmp}/${name}.gate"
+  env MODE="$mode" "$@" bash -c "$driver" bash "${tmp}/functions" "$jobs" "${tmp}/${name}.results" \
+    "${tmp}/${name}.gate" >"${tmp}/${name}.out" 2>&1 || true
+}
+
+same_file() {
+  local -r label="$1" left="$2" right="$3"
+  if cmp -s "$left" "$right"; then
+    pass_case "$label"
+  else
+    fail_case "$label"
+    diff "$left" "$right" >&2 || true
+  fi
+}
+
+printf '\n=== jobs: parallel run folds results like a serial run ===\n'
+run_case serial serial 1 GATE=0
+run_case par parallel 4 GATE=1
+sed -E "s/ in_subshell=(yes|no)//" "${tmp}/serial.out" >"${tmp}/serial.norm"
+sed -E "s/ in_subshell=(yes|no)//" "${tmp}/par.out" >"${tmp}/par.norm"
+same_file "combined output (replayed child output and the folded result) is identical for 4 jobs and 1" \
+  "${tmp}/serial.norm" "${tmp}/par.norm"
+assert_contains "worst exit is the highest repo exit" "$(cat "${tmp}/par.out")" "RESULT rc=0 worst=2 retained=1"
+assert_contains "failure summary lines are kept" "$(cat "${tmp}/par.out")" "SUMMARY c: exit 2 — boom"
+assert_contains "failure detail lines are kept" "$(cat "${tmp}/par.out")" "DETAIL c: detail one"
+
+printf '\n=== jobs: repos really run concurrently ===\n'
+assert_contains "gated repo completes only because a later repo ran at the same time" \
+  "$(cat "${tmp}/par.out")" "out:o/a"
+assert_not_contains "no gate timeout in the concurrent run" "$(cat "${tmp}/par.out")" "gate timeout"
+run_case par_two parallel 2 GATE=1
+assert_contains "2 jobs are enough to run the gated repo alongside the next one" \
+  "$(cat "${tmp}/par_two.out")" "RESULT rc=0 worst=2 retained=1"
+assert_contains "parallel mode runs repos in background workers" "$(cat "${tmp}/par.out")" "log:o/b in_subshell=yes"
+assert_contains "serial mode runs repos in the parent shell" "$(cat "${tmp}/serial.out")" "log:o/b in_subshell=no"
+
+printf '\n=== jobs: output is replayed in repo order ===\n'
+order="$(grep -o '^out:o/.' "${tmp}/par.out" | tr '\n' ' ')"
+assert_contains "replayed output follows repo order though o/a finished last" "$order" "out:o/a out:o/b out:o/c out:o/d "
+
+printf '\n=== jobs: a worker that dies is reported as a failed repo ===\n'
+run_case died parallel 4 GATE=1 DIE_D=1
+assert_contains "dead worker is logged" "$(cat "${tmp}/died.out")" "[batch-all] FAILED (o/d) worker exited before finishing"
+assert_contains "dead worker is in the failure summary" "$(cat "${tmp}/died.out")" "SUMMARY c: exit 2 — boom"
+assert_contains "dead worker summary names the repo" "$(cat "${tmp}/died.out")" "d: worker exited before finishing"
+
+printf '\n=== timings: baseline rows and the timings file ===\n'
+assert_contains "a recorded repo timing is folded into the run rows" "$(cat "${tmp}/par.out")" "TIMING_ROW b"$'\t'"ok"$'\t'"5"
+assert_contains "a repo without a timing is still listed as failed" "$(cat "${tmp}/par.out")" "TIMING_ROW c"$'\t'"failed"$'\t'"0"
+assert_contains "a dead worker is listed as died" "$(cat "${tmp}/died.out")" "TIMING_ROW d"$'\t'"died"$'\t'"0"
+same_file "timing rows are identical for 4 jobs and 1" \
+  <(grep '^TIMING_ROW' "${tmp}/serial.out") <(grep '^TIMING_ROW' "${tmp}/par.out")
+timings_file="${tmp}/timings/nested/timings.jsonl"
+timing_out="$(bash -c '
+  source "$1"
+  dry_run=1
+  log() { printf "%s\n" "$*"; }
+  batch_all_write_timings 3 42 $'"'"'a\tok\t30'"'"' $'"'"'b\tfailed\t20'"'"'
+' bash "${tmp}/functions" 2>&1)"
+assert_contains "the run logs wall time against the summed repo time" "$timing_out" \
+  "[batch-all] TIMING total wall_seconds=42 sum_repo_seconds=50 jobs=3 repos=2"
+env DEP_UPDATER_TIMINGS_FILE="$timings_file" bash -c '
+  source "$1"; dry_run=1; log() { :; }
+  batch_all_write_timings 3 42 $'"'"'a\tok\t30'"'"' $'"'"'b\tfailed\t20'"'"'
+  batch_all_write_timings 1 90 $'"'"'a\tok\t30'"'"'
+' bash "${tmp}/functions"
+assert_contains "one JSON line per run is appended with jobs and wall time" \
+  "$(jq -c '[.jobs, .wall_seconds, .sum_repo_seconds, .repos, .dry_run]' "$timings_file" | tr '\n' ' ')" \
+  "[3,42,50,2,true] [1,90,30,1,true] "
+assert_contains "per-repo results are recorded in the JSON line" \
+  "$(jq -c '.results[1]' "$timings_file" | head -n 1)" '{"repo":"b","status":"failed","seconds":20}'
+rm -rf "${tmp}/timings"
+env DEP_UPDATER_TIMINGS_FILE='' HOME="${tmp}/nohome" bash -c 'source "$1"; dry_run=0; log() { :; }; batch_all_write_timings 1 1 $'"'"'a\tok\t1'"'"'' bash "${tmp}/functions"
+if [[ ! -e "${tmp}/nohome" ]]; then
+  pass_case "an empty DEP_UPDATER_TIMINGS_FILE disables the timings file"
+else
+  fail_case "an empty DEP_UPDATER_TIMINGS_FILE disables the timings file"
+fi
+
+printf '\n=== jobs: a wait -n that reports 127 never drops repos ===\n'
+run_case race parallel 2 GATE=0 RACE_127=1
+assert_contains "every repo is still folded when wait -n returns 127" "$(cat "${tmp}/race.out")" "RESULT rc=0 worst=2 retained=1"
+assert_contains "the last repo is still replayed when wait -n returns 127" "$(cat "${tmp}/race.out")" "out:o/d"
+assert_contains "the last repo is still folded when wait -n returns 127" "$(cat "${tmp}/race.out")" "TIMING_ROW c"
+
+printf '\n=== timings: repo names are escaped in the JSON line ===\n'
+env DEP_UPDATER_TIMINGS_FILE="${tmp}/quoted.jsonl" bash -c '
+  source "$1"; dry_run=0; log() { :; }
+  batch_all_write_timings 1 1 $'"'"'we"ird\\name\tok\t1'"'"'
+' bash "${tmp}/functions"
+assert_contains "a repo name with a quote and a backslash stays valid JSON" \
+  "$(jq -r '.results[0].repo' "${tmp}/quoted.jsonl")" 'we"ird\name'
+
+printf '\n=== jobs: a terminal keeps the default run serial (child prompts need stdin) ===\n'
+resolve_jobs() {
+  # resolve_jobs <tty:yes|no> <batch_all_jobs> [VAR=value ...]
+  local -r tty="$1" jobs="$2"
+  shift 2
+  env "$@" bash -c '
+    source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs="$3"
+    log() { printf "%s\n" "$*"; }
+    if [[ "$2" == yes ]]; then batch_all_stdin_is_tty() { return 0; }; else batch_all_stdin_is_tty() { return 1; }; fi
+    batch_all_resolve_jobs
+    printf "jobs=%s\n" "$batch_all_jobs"
+  ' bash "${tmp}/functions" "$tty" "$jobs"
+}
+tty_default="$(resolve_jobs yes '' DEP_UPDATER_JOBS=4)"
+assert_contains "an explicit DEP_UPDATER_JOBS is honoured at a terminal" "$tty_default" "jobs=4"
+assert_contains "an explicit DEP_UPDATER_JOBS at a terminal warns that prompts are skipped" "$tty_default" "parallel children have no stdin"
+tty_auto="$(env -u DEP_UPDATER_JOBS bash -c '
+  source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs=""; log() { printf "%s\n" "$*"; }
+  batch_all_default_jobs() { printf 4; }; batch_all_stdin_is_tty() { return 0; }
+  batch_all_resolve_jobs; printf "jobs=%s\n" "$batch_all_jobs"' bash "${tmp}/functions")"
+assert_contains "the default run is serial at a terminal" "$tty_auto" "jobs=1"
+assert_contains "the serial fallback at a terminal is explained" "$tty_auto" "stdin is a terminal, so running serially"
+assert_contains "an explicit --jobs 3 is honoured at a terminal" "$(resolve_jobs yes 3)" "jobs=3"
+assert_contains "the default count is kept when stdin is not a terminal" \
+  "$(env -u DEP_UPDATER_JOBS bash -c '
+    source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs=""; log() { :; }
+    batch_all_default_jobs() { printf 4; }; batch_all_stdin_is_tty() { return 1; }
+    batch_all_resolve_jobs; printf "jobs=%s\n" "$batch_all_jobs"' bash "${tmp}/functions")" "jobs=4"
+invalid_out="$(env DEP_UPDATER_JOBS=abc bash -c '
+  source "$1"; batch_all_jobs=""; die() { printf "DIE %s\n" "$*"; exit 1; }
+  batch_all_resolve_jobs' bash "${tmp}/functions" 2>&1 || true)"
+assert_contains "an invalid DEP_UPDATER_JOBS is an error" "$invalid_out" "DEP_UPDATER_JOBS requires a positive integer (got: abc)"
+
+printf '\n=== jobs: workers get private runner state ===\n'
+runner_out="$(bash -c '
+  source "$1"
+  RUNNER_SESSION_DIR="$(mktemp -d)"; export RUNNER_SESSION_DIR
+  parent_session="$RUNNER_SESSION_DIR"
+  batch_all_process_repo() {
+    printf "session=%s first_failure=%s\n" "$RUNNER_SESSION_DIR" "$RUNNER_FIRST_FAILURE_FILE"
+    mkdir -p "${RUNNER_SESSION_DIR}/uuid-$(basename "$2")"
+    printf "uuid-%s\n" "$(basename "$2")" >"${RUNNER_SESSION_DIR}/.order"
+  }
+  d="$(mktemp -d)"
+  ( batch_all_worker_main x "${d}/0" "" "" ) >"${d}/0.out" 2>&1
+  ( batch_all_worker_main x "${d}/1" "" "" ) >"${d}/1.out" 2>&1
+  printf "%s\n" "$(<"${d}/0.out")" "$(<"${d}/1.out")"
+  RUNNER_SESSION_DIR="$parent_session" batch_all_adopt_worker_session "${d}/0"
+  RUNNER_SESSION_DIR="$parent_session" batch_all_adopt_worker_session "${d}/1"
+  printf "adopted=%s\n" "$(tr "\n" " " <"${parent_session}/.order")"
+  printf "worker_dir_left=%s\n" "$(compgen -G "${parent_session}/worker-*" || true)"
+' bash "${tmp}/functions" 2>&1)"
+assert_contains "each worker runs in its own runner sub-session" "$runner_out" "/worker-0 first_failure="
+assert_contains "workers do not share a runner sub-session" "$runner_out" "/worker-1 first_failure="
+assert_contains "the parent adopts every worker's runner records in repo order" "$runner_out" "adopted=uuid-0 uuid-1 "
+assert_contains "adopting removes the worker sub-session" "$runner_out" "worker_dir_left="$'\n'
+
+printf '\n=== static: EPOCHREALTIME is locale safe ===\n'
+# shellcheck disable=SC2016  # literal source patterns
+if grep -qF '${EPOCHREALTIME//[!0-9]/}' "$script" && ! grep -qF '${EPOCHREALTIME/./}' "$script"; then
+  pass_case "timing strips every non-digit from EPOCHREALTIME (comma-decimal locales)"
+else
+  fail_case "timing strips every non-digit from EPOCHREALTIME (comma-decimal locales)"
+fi
+
+printf '\n=== jobs: INT/TERM stops workers and their in-flight commands ===\n'
+extract_functions batch_all_cleanup_on_interrupt >>"${tmp}/functions"
+read -r -d '' intr_driver <<'DRIVER' || true
+set -euo pipefail
+source "$1"
+dir="$2"
+batch_all_jobs=2
+_batch_all_interrupted=0
+_batch_all_retained_clones=0
+_batch_all_pending_ephemeral_clone=0
+_batch_all_repo_colors=()
+_batch_all_worker_pids=()
+_batch_all_active_child_pid=""
+_batch_all_active_child_fifo=""
+_batch_all_active_child_log=""
+_batch_all_ephemeral_root=""
+_batch_all_results_dir="${dir}/results"
+log() { printf '%s\n' "$*" >&2; }
+batch_all_cleanup_ephemeral_root() { :; }
+dep_updater_batch_all_append_child_updates() { :; }
+batch_all_process_repo() {
+  local slug="${1%%$'\t'*}"
+  # A long-lived in-flight command (stands in for gh/pnpm/cargo) the worker is waiting on.
+  sleep 300 &
+  printf '%s\n' "$!" >"${dir}/inflight-${slug##*/}"
+  wait
+}
+mkdir -p "$_batch_all_results_dir"
+trap batch_all_cleanup_on_interrupt INT TERM
+worst_exit=0; failure_summaries=(); failure_details=()
+rc=0
+batch_all_run_parallel "$_batch_all_results_dir" "" $'o/a\t/x/a' $'o/b\t/x/b' || rc=$?
+printf 'RESULT rc=%s results_dir_exists=%s\n' "$rc" "$([[ -d "$_batch_all_results_dir" ]] && echo yes || echo no)"
+DRIVER
+mkdir -p "${tmp}/intr"
+bash -c "$intr_driver" bash "${tmp}/functions" "${tmp}/intr" >"${tmp}/intr.out" 2>&1 &
+intr_pid=$!
+spin=0
+while [[ ! -e "${tmp}/intr/inflight-a" || ! -e "${tmp}/intr/inflight-b" ]]; do
+  spin=$(( spin + 1 ))
+  (( spin < 3000000 )) || break
+done
+kill -TERM "$intr_pid" 2>/dev/null || true
+wait "$intr_pid" || true
+inflight_a="$(<"${tmp}/intr/inflight-a")"
+inflight_b="$(<"${tmp}/intr/inflight-b")"
+spin=0
+while { kill -0 "$inflight_a" 2>/dev/null || kill -0 "$inflight_b" 2>/dev/null; } && (( spin < 3000000 )); do
+  spin=$(( spin + 1 ))
+done
+if kill -0 "$inflight_a" 2>/dev/null || kill -0 "$inflight_b" 2>/dev/null; then
+  fail_case "in-flight commands of every worker are stopped on TERM"
+  kill "$inflight_a" "$inflight_b" 2>/dev/null || true
+else
+  pass_case "in-flight commands of every worker are stopped on TERM"
+fi
+assert_contains "the interrupt handler logs the interruption" "$(cat "${tmp}/intr.out")" "[batch-all] Interrupted."
+assert_not_contains "the run reports interrupted and the buffers are removed" \
+  "$(cat "${tmp}/intr.out")" "results_dir_exists=yes"
+
+printf '\n=== jobs: worker count defaults ===\n'
+jobs_for() {
+  bash -c 'source "$1"; batch_all_jobs_auto_cap=4; batch_all_default_jobs' bash "${tmp}/functions"
+}
+assert_contains "DEP_UPDATER_JOBS overrides the host core count" \
+  "$(DEP_UPDATER_JOBS=7 jobs_for)" "7"
+auto="$(env -u DEP_UPDATER_JOBS bash -c 'source "$1"; batch_all_jobs_auto_cap=4; batch_all_default_jobs' bash "${tmp}/functions")"
+if [[ "$auto" =~ ^[1-4]$ ]]; then
+  pass_case "the default is between 1 and the auto cap"
+else
+  fail_case "the default is between 1 and the auto cap (got: ${auto})"
+fi
+
+printf '\n=== jobs: argument handling ===\n'
+arg_out="$("$script" --batch --all --jobs 0 2>&1 || true)"
+assert_contains "--jobs 0 is rejected" "$arg_out" "--jobs requires a positive integer (got: 0)"
+arg_out="$("$script" --batch --all --jobs 2>&1 || true)"
+assert_contains "--jobs without a value is rejected" "$arg_out" "--jobs requires a positive integer."
+arg_out="$("$script" --jobs 2 --dry-run 2>&1 || true)"
+assert_contains "--jobs without --batch --all is rejected" "$arg_out" "--jobs requires --batch --all."
+arg_out="$("$script" --help 2>&1 || true)"
+assert_contains "usage documents --jobs" "$arg_out" "--jobs <n>"
+
+printf '\n=== static: batch-all parallel code ===\n'
+# shellcheck disable=SC2016  # the pattern is a literal awk/grep regex over the script source
+if awk '/^batch_all_dispatch\(\) \{/ { on = 1 } on && /dep_updater_batch_all_append_child_updates/ { found = 1 } END { exit found }' "$script"; then
+  pass_case "the dispatcher leaves updates-report merging to the in-order fold"
+else
+  fail_case "the dispatcher leaves updates-report merging to the in-order fold"
+fi
+if grep -q 'batch_all_process_repo' "$script" && grep -q 'wait -n' "$script"; then
+  pass_case "the parallel path blocks on wait -n instead of sleeping"
+else
+  fail_case "the parallel path blocks on wait -n instead of sleeping"
+fi
+
+printf '\n=== jobs: end to end over real child runs ===\n'
+e2e="${tmp}/e2e"
+home="${e2e}/home"
+mkdir -p "${e2e}/roots/alpha" "${e2e}/roots/beta" "${home}/.local/bin"
+for name in alpha beta; do
+  git -C "${e2e}/roots/${name}" -c user.name=t -c user.email=t@example.com init -q
+  git -C "${e2e}/roots/${name}" remote add origin "https://github.com/the-hcma/${name}.git"
+  git -C "${e2e}/roots/${name}" -c user.name=t -c user.email=t@example.com commit --allow-empty -q -m init
+done
+cat >"${home}/.local/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf '%s\n' $'alpha\tfalse\tfalse' $'beta\tfalse\tfalse'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${home}/.local/bin/gh"
+for jobs in 1 2; do
+  rc=0
+  rm -f "${e2e}/timings.jsonl"
+  out="$(cd "$e2e" && HOME="$home" PATH="${home}/.local/bin:${PATH}" DEP_UPDATER_TIMINGS_FILE="${e2e}/timings.jsonl" \
+    "$script" --batch --all --dry-run --jobs "$jobs" --scan-root "${e2e}/roots" 2>&1)" || rc=$?
+  assert_contains "--jobs ${jobs} run exits 0" "exit=${rc}" "exit=0"
+  assert_contains "--jobs ${jobs} run reports success" "$out" "[batch-all] All repos completed successfully."
+  assert_contains "--jobs ${jobs} run logs a timing line per repo" "$out" "[batch-all] TIMING repo=alpha status=ok seconds="
+  assert_contains "--jobs ${jobs} run logs the total timing line" "$out" "jobs=${jobs} repos=2"
+  assert_contains "--jobs ${jobs} run appends one JSON baseline line" \
+    "$(jq -c "[.jobs, .repos, (.results | length)]" "${e2e}/timings.jsonl")" "[${jobs},2,2]"
+  first="$(grep -n '\[batch-all\] --- alpha' <<<"$out" | head -n 1 | cut -d: -f1)"
+  second="$(grep -n '\[batch-all\] --- beta' <<<"$out" | head -n 1 | cut -d: -f1)"
+  if [[ -n "$first" && -n "$second" ]] && (( first < second )); then
+    pass_case "--jobs ${jobs} run lists alpha before beta"
+  else
+    fail_case "--jobs ${jobs} run lists alpha before beta"
+  fi
+done
+assert_contains "--jobs 2 announces the parallel run" "$out" "up to 2 parallel jobs"
+
+test_summary
