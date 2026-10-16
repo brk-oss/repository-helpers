@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# agent-review-reviewers — which agent reviewers are active for a repo (repository-helpers#716).
+#
+# Source of truth is two GitHub custom properties: `agent-reviewers` (multi-select: coderabbit,
+# copilot, bugbot) and `agent-review-enabled` (true/false). Precedence, highest first:
+#   1. AGENT_REVIEW_QUOTA_FALLBACK_CHAIN (explicit operator override; the property is not read)
+#   2. the repo's custom properties
+#   3. the built-in default: agent review enabled with coderabbit only
+#
+# The property filters the SET only; escalation order stays fixed in code. `agent-review-enabled`
+# set to false disables agent review (internally the sentinel chain `none`). An unset property, or a
+# failed read, falls back to the default (read failures WARN).
+# shellcheck disable=SC2016  # jq filter strings use single quotes
+
+_ar_reviewers_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ar_reviewers_lib_dir}/runner-ensure"
+
+# Every reviewer the property can select, in escalation order.
+agent_review_reviewers_known_chain='coderabbit,copilot,bugbot'
+# Active when nothing is configured.
+agent_review_reviewers_default_chain='coderabbit'
+agent_review_reviewers_enabled_property_name='agent-review-enabled'
+# Internal chain value for "agent review disabled" (never a valid property member).
+agent_review_reviewers_disabled_sentinel='@disabled'
+agent_review_reviewers_property_name='agent-reviewers'
+# Cache TTL for the property read (seconds); the property rarely changes mid-review.
+agent_review_reviewers_cache_ttl_s=300
+# A failed read is remembered this long so a quota or API outage is not re-tried (and re-warned)
+# on every chain lookup.
+agent_review_reviewers_failure_ttl_s=60
+
+# Prints the effective ordered, comma-separated reviewer chain for <repo> ("" when disabled).
+# Returns 0 always; a disabled repo is an empty chain, not an error.
+agent_review_reviewers_effective_chain() {
+  local -r repo="${1:-}"
+  local prop entry override out=""
+  local -a entries=()
+
+  if [[ -n "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}" ]]; then
+    # Trim each entry the way quota escalation does, so `coderabbit, copilot` matches `copilot`.
+    IFS=, read -r -a entries <<<"${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN}"
+    for entry in "${entries[@]}"; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      if [[ -n "${entry}" ]]; then
+        out+="${out:+,}${entry}"
+      fi
+    done
+    override="${out}"
+    # An override that trims to nothing (only spaces or commas) is no override: use the property.
+    if [[ -n "${override}" ]]; then
+      # The override takes the same `none` as the property: agent review disabled.
+      if [[ "${override}" == 'none' ]]; then
+        return 0
+      fi
+      printf '%s' "${override}"
+      return 0
+    fi
+  fi
+  if [[ -z "${repo}" ]]; then
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  prop="$(agent_review_reviewers_property_cached "${repo}")"
+  agent_review_reviewers_filter_chain "${prop}"
+}
+
+# agent_review_reviewers_filter_chain <property-csv> — applies the property to the default chain.
+agent_review_reviewers_filter_chain() {
+  local -r prop="${1:-}"
+  local member known out="" want=","
+  local -a members=() known_ids=()
+
+  if [[ -z "${prop}" ]]; then
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  if [[ "${prop}" == "${agent_review_reviewers_disabled_sentinel}" ]]; then
+    return 0
+  fi
+  IFS=, read -r -a members <<<"${prop}"
+  for member in "${members[@]}"; do
+    if [[ "${member}" == 'none' ]]; then
+      printf 'wait-for-agent-review: WARN: %s=%s is invalid (none is not a reviewer); using default\n' \
+        "${agent_review_reviewers_property_name}" "${prop}" >&2
+      printf '%s' "${agent_review_reviewers_default_chain}"
+      return 0
+    fi
+    if [[ -n "${member}" ]]; then
+      want+="${member},"
+    fi
+  done
+  IFS=, read -r -a known_ids <<<"${agent_review_reviewers_known_chain}"
+  for known in "${known_ids[@]}"; do
+    if [[ "${want}" == *",${known},"* ]]; then
+      out+="${out:+,}${known}"
+    fi
+  done
+  if [[ -z "${out}" ]]; then
+    printf 'wait-for-agent-review: WARN: %s=%s has no known reviewer; using default\n' \
+      "${agent_review_reviewers_property_name}" "${prop}" >&2
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  printf '%s' "${out}"
+}
+
+# True when <repo> has agent review disabled (agent-review-enabled=false): no sign-off needed.
+agent_review_reviewers_is_disabled() {
+  local chain
+
+  chain="$(agent_review_reviewers_effective_chain "${1:-}")"
+  [[ -z "${chain}" ]]
+}
+
+# True when <agent> is active for <repo>.
+agent_review_reviewers_is_enabled() {
+  local -r agent="$1"
+  local chain
+
+  chain="$(agent_review_reviewers_effective_chain "${2:-}")"
+  [[ ",${chain}," == *",${agent},"* ]]
+}
+
+# Prints the mtime (epoch) of <file>, or 0 when it cannot be read.
+agent_review_reviewers_mtime() {
+  local -r file="$1"
+  local mtime
+
+  if mtime="$(runner_exec_stdout "agent-reviewers cache mtime" -- stat --format=%Y "${file}" 2>/dev/null)"; then
+    printf '%s' "${mtime}"
+  else
+    printf '0'
+  fi
+}
+
+# Cached property read (file cache so $(...) subshells and repeated calls share one API hit).
+agent_review_reviewers_property_cached() {
+  local -r repo="$1"
+  local cache_dir cache_file now mtime value tmp
+
+  cache_dir="${AGENT_REVIEW_REVIEWERS_CACHE_DIR:-${HOME}/scratch/repository-helpers/agent-reviewers}"
+  cache_file="${cache_dir}/${repo//\//__}"
+  printf -v now '%(%s)T' -1
+  if [[ -f "${cache_file}" ]]; then
+    mtime="$(agent_review_reviewers_mtime "${cache_file}")"
+    if (( now - mtime < agent_review_reviewers_cache_ttl_s )); then
+      printf '%s' "$(<"${cache_file}")"
+      return 0
+    fi
+  fi
+  if [[ -f "${cache_file}.fail" ]]; then
+    mtime="$(agent_review_reviewers_mtime "${cache_file}.fail")"
+    if (( now - mtime < agent_review_reviewers_failure_ttl_s )); then
+      return 0
+    fi
+  fi
+  if ! value="$(agent_review_reviewers_property_fetch "${repo}" 2>/dev/null)"; then
+    printf 'wait-for-agent-review: WARN: could not read %s for %s; using default reviewers\n' \
+      "${agent_review_reviewers_property_name}" "${repo}" >&2
+    if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
+      : >"${cache_file}.fail"
+    fi
+    return 0
+  fi
+  if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
+    # Write via a temp file so a concurrent reader never sees a half-written (empty) cache.
+    if tmp="$(runner_exec_stdout "agent-reviewers cache temp file" -- mktemp "${cache_file}.XXXXXX" 2>/dev/null)"; then
+      printf '%s' "${value}" >"${tmp}"
+      agent_review_reviewers_run_quiet mv "${tmp}" "${cache_file}"
+    fi
+    agent_review_reviewers_run_quiet rm --force "${cache_file}.fail"
+  fi
+  printf '%s' "${value}"
+}
+
+# Prints the property value as a comma-separated list; empty when unset. Returns 1 on API failure.
+agent_review_reviewers_property_fetch() {
+  local -r repo="$1"
+
+  ar_runner_gh_api_stream "agent-review ${agent_review_reviewers_property_name} property" \
+    "repos/${repo}/properties/values" --jq \
+    '(map({(.property_name): .value}) | add // {}) as $p
+      | if ($p["'"${agent_review_reviewers_enabled_property_name}"'"] | tostring) == "false" then "'"${agent_review_reviewers_disabled_sentinel}"'"
+        else ($p["'"${agent_review_reviewers_property_name}"'"] // [])
+          | (if type == "array" then . else [.] end) | map(select(. != null)) | join(",")
+        end'
+}
+
+# Runs a cache-maintenance command through the runner; its output is not interesting.
+agent_review_reviewers_run_quiet() {
+  runner_exec "agent-reviewers cache $1" -- "$@" >/dev/null 2>&1
+}
+
+# agent_review_reviewers_select_agent <repo> — makes the active agent one the repo enables.
+# Keeps AGENT_REVIEW_AGENT when the repo enables it; otherwise switches to the first enabled
+# reviewer (escalation order). Returns 1 when no reviewer is enabled.
+agent_review_reviewers_select_agent() {
+  local -r repo="${1:-}"
+  local -r current="${AGENT_REVIEW_AGENT:-copilot}"
+  local chain first
+
+  if agent_review_reviewers_is_enabled "${current}" "${repo}"; then
+    return 0
+  fi
+  chain="$(agent_review_reviewers_effective_chain "${repo}")"
+  first="${chain%%,*}"
+  if [[ -z "${first}" ]]; then
+    return 1
+  fi
+  agent_review_use_agent "${first}"
+  printf 'wait-for-agent-review: %s is not an enabled reviewer for %s; using %s\n' \
+    "${current}" "${repo}" "${first}" >&2
+  return 0
+}

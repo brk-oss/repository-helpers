@@ -547,15 +547,24 @@ else
   pass=$(( pass + 1 ))
 fi
 
-if bash -c \
+# Stub gh and the cache so the checkout's own `agent-reviewers` property cannot change the answer.
+unset_gh_bin="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${unset_gh_bin}/gh"
+chmod +x "${unset_gh_bin}/gh"
+if env -u AGENT_REVIEW_QUOTA_FALLBACK_CHAIN PATH="${unset_gh_bin}:${PATH}" AGENT_REVIEW_REVIEWERS_CACHE_DIR="${unset_gh_bin}/cache" \
+  AGENT_REVIEW_ENV_FILE=/dev/null bash -c \
   "source '${lib}'; printf '%s' \"\$(agent_review_quota_fallback_chain_raw)\"" \
-  | grep -qxF 'coderabbit,copilot,bugbot'; then
-  printf '[PASS] agent-review: default quota fallback chain is coderabbit,copilot,bugbot\n'
+  | grep -qxF 'coderabbit'; then
+  printf '[PASS] agent-review: default quota fallback chain is coderabbit only (#716)\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] agent-review: unexpected default quota fallback chain\n'
   fail=$(( fail + 1 ))
 fi
+
+# The remaining quota scenarios exercise the full escalation chain, so pin it (the default is
+# coderabbit only since #716).
+export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN='coderabbit,copilot,bugbot'
 
 if next="$(bash -c \
   "source '${lib}'; source '${quota_lib}'; agent_review_quota_escalation_next_agent copilot")" \
@@ -590,7 +599,8 @@ fi
 
 printf '\n=== quota: confirmed only after review, not passive probe ===\n'
 if grep -qF 'agent_review_quota_escalation_chain_raw' "$quota_lib" \
-  && grep -qF 'AGENT_REVIEW_QUOTA_FALLBACK_CHAIN' "$quota_lib" \
+  && grep -qF 'agent_review_reviewers_effective_chain' "$quota_lib" \
+  && grep -qF 'AGENT_REVIEW_QUOTA_FALLBACK_CHAIN' "${script_dir}/../scripts/lib/agent-review-reviewers" \
   && grep -qF 'agent_review_agent_quota_confirmed_for_agent' "$quota_lib" \
   && grep -qF 'unconfirmed (not probed today)' "$lib" \
   && grep -qF 'unconfirmed (will request to probe)' "$quota_lib" \
