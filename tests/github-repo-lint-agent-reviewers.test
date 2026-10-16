@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Tests for the agent-reviewers custom property check in scripts/lib/repo-practices (#716).
+# Kept apart from tests/github-repo-lint-part-*.test, which are already at the ~60s shard budget.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck source=tests/lib/github-repo-lint-part-init
+source "${script_dir}/lib/github-repo-lint-part-init"
+
+pass=0
+fail=0
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+mock_bin="${work_dir}/bin"
+capture="${work_dir}/capture"
+mkdir -p "$mock_bin"
+
+# Mock gh: serves MOCK_VALUES for the repo properties read; records the org schema PUT and its payload.
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+case "$args" in
+  *properties/values*)
+    if [[ "${MOCK_VALUES_FAIL:-0}" == '1' ]]; then
+      printf 'HTTP 403\n' >&2
+      exit 1
+    fi
+    cat "${MOCK_VALUES}"
+    exit 0
+    ;;
+  *--method\ PUT*orgs/*/properties/schema/*)
+    printf '%s\n' "$args" >>"${MOCK_ATTEMPTS:-/dev/null}"
+    if [[ "${MOCK_PUT_FAIL:-0}" == '1' ]]; then
+      printf 'gh: Not Found (HTTP 404)\n' >&2
+      exit 1
+    fi
+    printf '%s\n' "$args" >>"${MOCK_CAPTURE}"
+    while (( $# > 0 )); do
+      if [[ "$1" == '--input' ]]; then
+        cat "$2" >>"${MOCK_CAPTURE}"
+        printf '\n' >>"${MOCK_CAPTURE}"
+      fi
+      shift
+    done
+    exit 0
+    ;;
+  *orgs/*/properties/schema*)
+    if [[ "${MOCK_SCHEMA_FAIL:-0}" == '1' ]]; then
+      printf 'HTTP 403\n' >&2
+      exit 1
+    fi
+    both='[{"property_name":"agent-reviewers"},{"property_name":"agent-review-enabled"}]'
+    printf '%s' "${MOCK_SCHEMA:-$both}"
+    exit 0
+    ;;
+esac
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+# run_check <values-json> <suggest> <apply-fix> [extra env…] — prints "rc=<n>" then the log.
+run_check() {
+  local -r values="$1" suggest="$2" apply="$3"
+  shift 3
+
+  printf '%s' "$values" >"${work_dir}/values.json"
+  : >"$capture"
+  # shellcheck disable=SC2016  # the bash -c body is intentionally single-quoted
+  env RUNNER_SESSION_ROOT="${work_dir}/runner-sessions" MOCK_VALUES="${work_dir}/values.json" \
+    MOCK_CAPTURE="$capture" PATH="${mock_bin}:${PATH}" "$@" \
+    bash -c '
+      set -uo pipefail
+      # shellcheck disable=SC1091
+      source "$1"
+      # shellcheck disable=SC1091
+      source "$2"
+      rp_suggest="$3"
+      rp_apply_fix="$4"
+      for _ in $(seq "${CHECK_REPEAT:-1}"); do
+        rc=0
+        rp_check_agent_reviewers_property the-hcma/example-repo || rc=$?
+        printf "rc=%s\n" "$rc"
+      done
+    ' bash "$runner_bootstrap" "$lib" "$suggest" "$apply" 2>&1
+}
+
+check() {
+  local -r label="$1" haystack="$2" needle="$3"
+
+  if grep -qF -- "$needle" <<<"$haystack"; then
+    printf '[PASS] %s\n' "$label"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s (missing %q in: %s)\n' "$label" "$needle" "$haystack"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+printf '\n=== agent-reviewers property: defined values ===\n'
+en_true='{"property_name":"agent-review-enabled","value":"true"}'
+out="$(run_check '[{"property_name":"agent-reviewers","value":["copilot","bugbot"]},'"$en_true"']' 0 0)"
+check "a valid multi-select value passes" "$out" "rc=0"
+check "a valid value logs OK" "$out" "agent reviewers property"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":null},{"property_name":"agent-review-enabled","value":null}]' 0 0)"
+check "unset values pass" "$out" "rc=0"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["coderabbit"]},{"property_name":"agent-review-enabled","value":"false"}]' 0 0)"
+check "agent-review-enabled false is valid" "$out" "rc=0"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["none"]},'"$en_true"']' 0 0)"
+check "none is no longer a reviewer value" "$out" "rc=1"
+check "the failure names the property" "$out" "custom property 'agent-reviewers' has an invalid value"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["gemini"]},'"$en_true"']' 0 0)"
+check "an unknown reviewer fails" "$out" "rc=1"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["coderabbit"]},{"property_name":"agent-review-enabled","value":"maybe"}]' 0 0)"
+check "a non-boolean enabled value fails" "$out" "rc=1"
+check "the enabled failure names the property" "$out" "custom property 'agent-review-enabled' has an invalid value"
+
+printf '\n=== agent-reviewers property: undefined or unreadable ===\n'
+out="$(run_check '[{"property_name":"team","value":"x"}]' 1 0 MOCK_SCHEMA='[]')"
+check "an undefined property does not fail the audit" "$out" "rc=0"
+check "an undefined property suggests defining it" "$out" "define org custom properties 'agent-reviewers' and 'agent-review-enabled'"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":null}]' 1 0 MOCK_SCHEMA='[{"property_name":"agent-reviewers"}]')"
+check "a missing enabled property still suggests defining it" "$out" "define org custom properties"
+
+out="$(run_check '[]' 0 0 MOCK_VALUES_FAIL=1)"
+check "an unreadable property does not fail the audit" "$out" "rc=0"
+
+out="$(run_check '[]' 1 0 MOCK_SCHEMA_FAIL=1)"
+check "an unreadable org schema does not fail the audit" "$out" "rc=0"
+if grep -qF "define org custom properties" <<<"$out"; then
+  printf '[FAIL] an unreadable org schema must not suggest defining the properties\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] an unreadable org schema stays silent\n'
+  pass=$(( pass + 1 ))
+fi
+
+out="$(run_check '[]' 1 0)"
+check "defined properties that a repo never set pass" "$out" "rc=0"
+if grep -qF "define org custom properties" <<<"$out"; then
+  printf '[FAIL] defined but unset properties must not suggest defining them\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] defined but unset properties raise no suggestion\n'
+  pass=$(( pass + 1 ))
+fi
+
+printf '\n=== agent-reviewers property: --apply-fix defines the org schemas ===\n'
+out="$(run_check '[]' 0 1 MOCK_SCHEMA='[]')"
+check "apply-fix succeeds" "$out" "rc=0"
+cap="$(cat "$capture")"
+check "apply-fix PUTs the reviewers schema" "$cap" "orgs/the-hcma/properties/schema/agent-reviewers"
+check "apply-fix PUTs the enabled schema" "$cap" "orgs/the-hcma/properties/schema/agent-review-enabled"
+check "the reviewers schema is a multi-select" "$cap" '"value_type":"multi_select"'
+check "the enabled schema is true/false" "$cap" '"value_type":"true_false"'
+check "the reviewers schema lists only reviewers" "$cap" '"allowed_values":["coderabbit","copilot","bugbot"]'
+check "the schemas carry no default value (GitHub rejects one on an optional property)" "default_value count=$(grep -c default_value <<<"$cap" || true)" "default_value count=0"
+
+printf '\n=== agent-reviewers property: a failed schema PUT is reported ===\n'
+out="$(run_check '[]' 0 1 MOCK_SCHEMA='[]' MOCK_PUT_FAIL=1)"
+check "a failed schema PUT does not fail the audit" "$out" "rc=0"
+check "a failed schema PUT warns about the missing scope" "$out" "admin:org"
+check "a failed schema PUT suggests the settings UI" "$out" "in the org settings"
+
+: >"${work_dir}/attempts"
+out="$(run_check '[]' 0 1 MOCK_SCHEMA='[]' MOCK_PUT_FAIL=1 CHECK_REPEAT=2 MOCK_ATTEMPTS="${work_dir}/attempts")"
+check "a failed apply is attempted once across repos" "attempts=$(wc -l <"${work_dir}/attempts")" "attempts=1"
+check "every repo after a failed apply still suggests the settings UI" "suggestions=$(grep -c "define org custom properties" <<<"$out")" "suggestions=2"
+
+printf '\n=== static: wiring ===\n'
+# shellcheck disable=SC2016  # literal source text, not an expansion
+if grep -qF 'rp_check_agent_reviewers_property "$slug"' "$lib"; then
+  printf '[PASS] the check runs in the full audit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] the check runs in the full audit\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '%s passed, %s failed\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
