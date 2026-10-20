@@ -129,6 +129,7 @@ else
 fi
 
 loop_exit_template="${script_dir}/../scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md"
+readonly loop_exit_template
 if [[ -f "$skill" ]] \
   && grep -qF 'Running the loop so its exit is noticed' "$skill" \
   && grep -qF 'its own tracked background command' "$skill" \
