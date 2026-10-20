@@ -113,7 +113,7 @@ Prefer the built-in loop (posts a PR comment + emails on timeout give-up):
 
 - Run the loop directly as its own tracked background command (for example `run_in_background` in Claude Code), never through a launcher subshell that detaches it, so the loop's own exit is what notifies the caller.
 - A completion notification that names a launcher or wrapper is not a loop result; confirm with the process list and the log tail before reporting the loop as still waiting or finished.
-- The loop exits **3** when feedback needs a reply or resolve, and nothing else pushes that to anyone: when it exits 3, triage immediately (read `check`, fix or decline, reply on the thread, resolve, push).
+- The loop exits **3** when feedback needs a reply or resolve, and nothing else pushes that to anyone: when it exits 3, triage immediately (read `check` and `list-feedback`, fix or decline, then reply and resolve by feedback kind — `reply-thread`/`resolve-thread` for review threads, `reply-comment`/`resolve-comment` for issue comments and review bodies — and push).
 - Waiters longer than the harness's background cap must be chunked and re-armed; check the clock when each chunk ends instead of assuming a killed chunk was still waiting.
 - If a wrapper is unavoidable, the exit code of its trailing `echo` is not the loop's exit code; read the result the wrapper recorded for the loop (for example a `loop exit=` line in its log) — no first-party script writes such a line.
 
