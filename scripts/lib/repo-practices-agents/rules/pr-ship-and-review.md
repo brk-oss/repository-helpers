@@ -84,6 +84,8 @@ Prefer the built-in loop:
 "${rh}/scripts/wait-for-agent-review" loop --pr <n>
 ```
 
+Run the loop directly as its own tracked background command (for example `run_in_background` in Claude Code), never through a launcher that detaches it, so its own exit notifies the caller; a notification naming a launcher or wrapper is not a loop result (confirm with the process list and the log tail), a wrapper `echo` exit code is not the loop's (read its `loop exit=` line), and waiters longer than the harness's background cap must be chunked and re-armed with a clock check at each chunk end. The loop exits **3** when feedback needs a reply or resolve and nothing else pushes that to anyone, so triage immediately on exit 3 (read `check`, fix or decline, reply on the thread, resolve, push). Full detail: canonical Skill §3.
+
 **Early complete:** when all threads are addressed, CI is green, there is **no** pending requested Copilot/Bugbot review, and CodeRabbit’s workflow is **not** running, the loop finishes — no mandatory idle dwell. **12h PR cap** (`AGENT_REVIEW_PR_TIMEOUT`) when review cycles never converge (exit **6** give-up). Per-agent quota caches skip exhausted agents (CodeRabbit, Copilot, Bugbot).
 
 **CodeRabbit is on_push:** a new push starts CodeRabbit — never post `@coderabbitai review`. If quota-limited, wait the cooldown with feedback polls (issue #369; default poll **60s**) + grace (default **60s**); only then, if still no real review on head, the loop may post a one-shot `@coderabbitai full review`. When CodeRabbit says wait, do not re-ask until `retry_after`. Rate-limit stubs are not reviews. Mid-cooldown pending feedback wakes the loop (exit **3**).

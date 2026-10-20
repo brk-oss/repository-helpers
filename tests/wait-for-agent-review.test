@@ -128,6 +128,28 @@ else
   fail=$(( fail + 1 ))
 fi
 
+loop_exit_template="${script_dir}/../scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md"
+if [[ -f "$skill" ]] \
+  && grep -qF 'Running the loop so its exit is noticed' "$skill" \
+  && grep -qF 'its own tracked background command' "$skill" \
+  && grep -qF 'never through a launcher subshell that detaches it' "$skill" \
+  && grep -qF 'is not a loop result; confirm with the process list and the log tail' "$skill" \
+  && grep -qF 'nothing else pushes that to anyone: when it exits 3, triage immediately' "$skill" \
+  && grep -qF 'must be chunked and re-armed; check the clock when each chunk ends' "$skill" \
+  && grep -qF "The exit code of a wrapper's \`echo\` is not the loop's exit code" "$skill" \
+  && grep -qF 'line the wrapper wrote' "$skill" \
+  && grep -qF 'its own tracked background command' "$loop_exit_template" \
+  && grep -qF 'is not a loop result' "$loop_exit_template" \
+  && grep -qF 'chunked and re-armed' "$loop_exit_template" \
+  && grep -qF 'loop exit=' "$loop_exit_template" \
+  && grep -qF 'triage immediately on exit 3' "$loop_exit_template"; then
+  printf '[PASS] ship-and-review Skill + template: running the loop so its exit is noticed (#745)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ship-and-review Skill + template: missing loop-exit caller guidance (#745)\n'
+  fail=$(( fail + 1 ))
+fi
+
 if grep -qF 'ship-and-review/SKILL.md' "$agents_md" \
   && grep -qF 'wait-for-agent-review complete' "$agents_md" \
   && grep -qF 'reply-thread' "$agents_md" \
