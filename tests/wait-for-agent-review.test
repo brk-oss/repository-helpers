@@ -141,10 +141,17 @@ if [[ -f "$skill" ]] \
   && grep -qF 'read the result the wrapper recorded for the loop' "$skill" \
   && grep -qF 'no first-party script writes such a line' "$skill" \
   && grep -qF 'its own tracked background command' "$loop_exit_template" \
+  && grep -qF 'never through a launcher that detaches it' "$loop_exit_template" \
   && grep -qF 'is not a loop result' "$loop_exit_template" \
+  && grep -qF 'confirm with the process list and the log tail' "$loop_exit_template" \
   && grep -qF 'chunked and re-armed' "$loop_exit_template" \
+  && grep -qF 'with a clock check at each chunk end' "$loop_exit_template" \
   && grep -qF 'loop exit=' "$loop_exit_template" \
-  && grep -qF 'triage immediately on exit 3' "$loop_exit_template"; then
+  && grep -qF "a wrapper \`echo\` exit code is not the loop's" "$loop_exit_template" \
+  && grep -qF 'read the result it recorded' "$loop_exit_template" \
+  && grep -qF 'no first-party script writes such a line' "$loop_exit_template" \
+  && grep -qF 'nothing else pushes that to anyone, so triage immediately on exit 3' "$loop_exit_template" \
+  && grep -qF 'fix or decline, reply on the thread, resolve, push' "$loop_exit_template"; then
   printf '[PASS] ship-and-review Skill + template: running the loop so its exit is noticed (#745)\n'
   pass=$(( pass + 1 ))
 else
