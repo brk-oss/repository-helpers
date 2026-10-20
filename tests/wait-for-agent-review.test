@@ -137,8 +137,9 @@ if [[ -f "$skill" ]] \
   && grep -qF 'is not a loop result; confirm with the process list and the log tail' "$skill" \
   && grep -qF 'nothing else pushes that to anyone: when it exits 3, triage immediately' "$skill" \
   && grep -qF 'must be chunked and re-armed; check the clock when each chunk ends' "$skill" \
-  && grep -qF "The exit code of a wrapper's \`echo\` is not the loop's exit code" "$skill" \
-  && grep -qF 'line the wrapper wrote' "$skill" \
+  && grep -qF "the exit code of its trailing \`echo\` is not the loop's exit code" "$skill" \
+  && grep -qF 'read the result the wrapper recorded for the loop' "$skill" \
+  && grep -qF 'no first-party script writes such a line' "$skill" \
   && grep -qF 'its own tracked background command' "$loop_exit_template" \
   && grep -qF 'is not a loop result' "$loop_exit_template" \
   && grep -qF 'chunked and re-armed' "$loop_exit_template" \

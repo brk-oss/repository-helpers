@@ -115,7 +115,7 @@ Prefer the built-in loop (posts a PR comment + emails on timeout give-up):
 - A completion notification that names a launcher or wrapper is not a loop result; confirm with the process list and the log tail before reporting the loop as still waiting or finished.
 - The loop exits **3** when feedback needs a reply or resolve, and nothing else pushes that to anyone: when it exits 3, triage immediately (read `check`, fix or decline, reply on the thread, resolve, push).
 - Waiters longer than the harness's background cap must be chunked and re-armed; check the clock when each chunk ends instead of assuming a killed chunk was still waiting.
-- The exit code of a wrapper's `echo` is not the loop's exit code; read the `loop exit=` line the wrapper wrote.
+- If a wrapper is unavoidable, the exit code of its trailing `echo` is not the loop's exit code; read the result the wrapper recorded for the loop (for example a `loop exit=` line in its log) — no first-party script writes such a line.
 
 **Early complete (nothing outstanding):** after all feedback is addressed (no pending threads, CI green, merge ready), the loop completes as soon as it is **not** waiting on a requested Copilot/Bugbot review and CodeRabbit’s workflow is **not** running. No mandatory idle dwell. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
 
