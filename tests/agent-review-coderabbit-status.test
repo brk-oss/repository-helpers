@@ -309,6 +309,101 @@ assert_contains "no ask means CodeRabbit owes nothing" "$out" "clear"
 out="$(answer_outstanding rate_limited "[${old_ask}]")"
 assert_contains "an ask older than an hour no longer holds the gate" "$out" "clear"
 
+# --- paused head: the loop resumes it with the gated full-review ask (#743) -------------------------------
+paused_statuses='[{"context":"CodeRabbit","state":"success","description":"Review paused","updated_at":"2026-10-14T21:45:02Z"}]'
+printf '\n=== paused head: told apart from a skipped one ===\n'
+out="$(run_lib "agent_review_coderabbit_head_paused_from_statuses '${paused_statuses}' && echo paused || echo not-paused")"
+assert_contains "a Review paused status is paused" "$out" "paused"
+assert_not_contains "a Review paused status is not 'not-paused'" "$out" "not-paused"
+out="$(run_lib "agent_review_coderabbit_head_paused_from_statuses '${statuses[other]}' && echo paused || echo not-paused")"
+assert_contains "a skipped review is not paused" "$out" "not-paused"
+out="$(run_lib "agent_review_coderabbit_head_paused_from_statuses '${statuses[foreign]}' && echo paused || echo not-paused")"
+assert_contains "another tool's status is not a paused CodeRabbit" "$out" "not-paused"
+out="$(run_lib "agent_review_coderabbit_head_paused_from_statuses '' && echo paused || echo not-paused")"
+assert_contains "no statuses is not paused" "$out" "not-paused"
+
+# resume <head state> <paused 0|1> <comments json> [rate-limited 0|1] [env] -> "resume-rc=N" + posted asks
+resume() {
+  : >"${work_dir}/exec.log"
+  bash -c "
+    set -uo pipefail
+    ${5:-:}
+    source '${wait_script}'
+    agent_review_coderabbit_head_state() { printf '%s\n' '$1'; }
+    agent_review_coderabbit_head_paused() { (( $2 == 1 )); }
+    agent_review_pr_issue_comments_json() { printf '%s' '$3'; }
+    agent_review_agent_quota_rate_limited_for_agent() { (( ${4:-0} == 1 )); }
+    agent_review_agent_quota_cache_retry_after_for_agent() { printf 'soon'; }
+    runner_exec() {
+      if [[ \"\$*\" == *'gh pr comment'* ]]; then printf 'EXEC %s\n' \"\$*\" >>'${work_dir}/exec.log'; return 0; fi
+      shift 2 || true
+      command \"\$@\"
+    }
+    rc=0
+    cmd_loop_resume_paused_coderabbit o/r 5 '${head_sha}' || rc=\$?
+    echo resume-rc=\$rc" 2>&1
+}
+printf '\n=== the loop: a paused head gets one gated full-review ask ===\n'
+out="$(resume other 1 '[]')"
+assert_contains "a paused head with no ask is resumed" "$out" "resume-rc=0"
+assert_contains "the resume ask is the full review" "$(cat "${work_dir}/exec.log")" "gh pr comment 5 --repo o/r"
+assert_contains "the resume ask carries the head marker" "$(cat "${work_dir}/exec.log")" "coderabbit-full:${head_sha}"
+out="$(resume other 1 "[${recent_ask}]")"
+assert_contains "a paused head that already has an ask is not asked again" "$out" "resume-rc=1"
+assert_not_contains "no second ask is posted" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+out="$(resume other 1 '[]' 1)"
+assert_contains "a rate-limited paused head is not asked" "$out" "resume-rc=1"
+assert_not_contains "no ask is posted while rate limited" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+out="$(resume other 0 '[]')"
+assert_contains "a skipped (not paused) head is left alone" "$out" "resume-rc=1"
+out="$(resume completed 1 '[]')"
+assert_contains "a completed head needs no resume" "$out" "resume-rc=1"
+out="$(resume other 1 '[]' 0 'export AGENT_REVIEW_CODERABBIT_RESUME_PAUSED=0')"
+assert_contains "the opt-out leaves a paused review paused" "$out" "resume-rc=1"
+assert_not_contains "the opt-out posts nothing" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+resume_with() {
+  # $1 extra stub lines, $2 call args -> "resume-rc=N agent=<active agent>" and the posted asks
+  : >"${work_dir}/exec.log"
+  bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    agent_review_coderabbit_head_state() { printf 'other\n'; }
+    agent_review_coderabbit_head_paused() { return 0; }
+    agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+    agent_review_pr_issue_comments_json() { printf '[]'; }
+    runner_exec() {
+      if [[ \"\$*\" == *'gh pr comment'* ]]; then printf 'EXEC %s\n' \"\$*\" >>'${work_dir}/exec.log'; return 0; fi
+      shift 2 || true
+      command \"\$@\"
+    }
+    $1
+    AGENT_REVIEW_AGENT=copilot
+    rc=0
+    cmd_loop_resume_paused_coderabbit o/r 5 '${head_sha}' $2 || rc=\$?
+    echo resume-rc=\$rc agent=\${AGENT_REVIEW_AGENT}" 2>&1
+}
+out="$(resume_with ':' '')"
+assert_contains "the active agent is restored after the resume ask" "$out" "agent=copilot"
+out="$(resume_with 'agent_review_pr_issue_comments_json() { return 1; }' '')"
+assert_contains "an unreadable comment list posts nothing and hands back" "$out" "resume-rc=1"
+assert_not_contains "no ask is posted when the comments cannot be read" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+assert_contains "the active agent is restored on the no-ask path" "$out" "agent=copilot"
+# shellcheck disable=SC2016  # the stub text is evaluated by the inner shell, not expanded here
+out="$(resume_with 'agent_review_profile_request_last_resort_full_review() { return 0; }; calls=0; agent_review_agent_quota_rate_limited_for_agent() { calls=$((calls + 1)); (( calls > 1 )); }' '')"
+assert_contains "an ask refused by a rate limit that began after the check is not reported as posted" "$out" "resume-rc=1"
+out="$(resume_with 'agent_review_agent_signed_off_on_head() { return 0; }' "'{}'")"
+assert_contains "a head an agent already signed off on is not resumed" "$out" "resume-rc=1"
+assert_not_contains "no ask is posted for a signed-off head" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+out="$(run_lib "ar_runner_gh_api_stream() { return 1; }; agent_review_coderabbit_head_paused o/r '${head_sha}' && echo paused || echo read-failed")"
+assert_contains "a failed status read is never treated as paused" "$out" "read-failed"
+# shellcheck disable=SC2016  # literal source text to look for, not an expansion
+resume_rate_order="$(awk '
+  index($0, "cmd_loop_resume_paused_coderabbit \"${repo}\" \"${pr}\" \"${head}\" \"${snapshot}\"") { resume=NR }
+  index($0, "cmd_loop_handle_coderabbit_rate_limit \"${repo}\" \"${pr}\" \"${head}\" \"${snapshot}\"") { rate_limit=NR }
+  END { print (resume > 0 && rate_limit > resume) ? "ordered" : "wrong" }
+' "${wait_script}")"
+assert_contains "the loop calls the resume step before the rate-limit handler" "${resume_rate_order}" "ordered"
+
 # --- sign-off: a clean zero-comment pass counts, a rate-limited head does not --------------------------------
 signed_off() {
   # $1 head state, $2 PR comments json (default none), $3 CodeRabbit reviews on the head (default
