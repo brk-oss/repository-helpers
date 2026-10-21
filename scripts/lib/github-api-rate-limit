@@ -26,6 +26,10 @@
 #     any non-read `gh` subcommand forwarded by scripts/gh-api) is never retried.
 #   GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S     comma-separated backoff ladder by
 #     attempt for the above (default 2,5,15).
+#   GITHUB_API_ATTEMPT_TIMEOUT_S   per-attempt wall-clock cap on the wrapped command (default 300,
+#     long enough for a large --paginate read; 0 disables). A killed attempt counts as a transient
+#     failure: reads are retried under the transient-network bounds, a mutation is never repeated
+#     (repository-helpers#741).
 
 set -euo pipefail
 
@@ -175,6 +179,9 @@ _github_api_rl_cmd_is_write() {
   if [[ "${args[gh_idx + 2]:-}" == 'graphql' ]]; then
     for (( i = gh_idx + 3; i < n; i++ )); do
       [[ "${args[i]}" == *mutation* ]] && return 0
+      # A query read from a file or stdin (-F query=@op.graphql, --input) hides its operation, so it may be a
+      # mutation: treat it as a write and never repeat it after a timeout or a dropped connection.
+      [[ "${args[i]}" == *=@* || "${args[i]}" == '--input' || "${args[i]}" == --input=* ]] && return 0
     done
     return 1
   fi
@@ -245,6 +252,32 @@ _github_api_transient_network_backoff_s() {
   fi
 }
 
+# _github_api_attempt_timeout_s
+# Per-attempt wall-clock cap for the wrapped command, in seconds. A stalled request must not block a caller
+# forever (remote-timeouts-retries). GITHUB_API_ATTEMPT_TIMEOUT_S overrides the default, which is generous
+# enough for a large --paginate read; 0 turns the cap off, anything else that is not an integer falls back
+# to the default. Prints nothing when the cap is off. Fails (exit 2) when a cap is wanted but neither
+# timeout(1) nor gtimeout(1) is on PATH: running uncapped would silently drop the guarantee.
+_github_api_attempt_timeout_s() {
+  local value
+
+  value="${GITHUB_API_ATTEMPT_TIMEOUT_S:-300}"
+  # At most six digits (about eleven days) so the arithmetic below cannot overflow.
+  if [[ ! "$value" =~ ^[0-9]{1,6}$ ]]; then
+    value=300
+  fi
+  # Decimal on purpose: a leading zero ("08") is not octal here.
+  value=$((10#$value))
+  (( value > 0 )) || return 0
+  if ! runner_timeout_bin >/dev/null 2>&1; then
+    printf 'github_api_exec_with_rate_limit_retry: GITHUB_API_ATTEMPT_TIMEOUT_S=%s needs timeout(1) or gtimeout(1) on PATH\n' \
+      "$value" >&2
+    printf '  install coreutils, or set GITHUB_API_ATTEMPT_TIMEOUT_S=0 to run uncapped\n' >&2
+    return 2
+  fi
+  printf '%s' "$value"
+}
+
 # github_api_exec_with_rate_limit_retry <label> [--probe] -- <cmd> [args…]
 # Runs via runner_exec (no mid-attempt stdout stream). On success, prints that
 # attempt's captured stdout once — avoids concatenating partial --paginate pages
@@ -255,6 +288,8 @@ github_api_exec_with_rate_limit_retry() {
   local exit_code attempt max_retries detail headers uuid should_wait wait_ec
   local final_quota_retry=0
   local net_attempt=1 net_max_retries net_sleep
+  local attempt_timeout_s timed_out timeout_bin
+  local -a exec_cmd=()
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -283,15 +318,22 @@ github_api_exec_with_rate_limit_retry() {
 
   max_retries="$(_github_api_rate_limit_effective_max_retries)"
   net_max_retries="$(_github_api_transient_network_effective_max_retries)"
+  # The cap wraps only what runs; the read/write classification below keeps looking at the caller's command.
+  exec_cmd=("${rl_cmd[@]}")
+  attempt_timeout_s="$(_github_api_attempt_timeout_s)" || return $?
+  if [[ -n "$attempt_timeout_s" ]]; then
+    timeout_bin="$(runner_timeout_bin)"
+    exec_cmd=("$timeout_bin" "--kill-after=${_runner_timeout_kill_after_sec:-5}" "${attempt_timeout_s}s" "${rl_cmd[@]}")
+  fi
 
   attempt=1
   while (( attempt <= max_retries || final_quota_retry == 1 )); do
     exit_code=0
     github_api_pace_gate "$label"
     if (( probe )); then
-      runner_exec "$label" --probe -- "${rl_cmd[@]}" || exit_code=$?
+      runner_exec "$label" --probe -- "${exec_cmd[@]}" || exit_code=$?
     else
-      runner_exec "$label" -- "${rl_cmd[@]}" || exit_code=$?
+      runner_exec "$label" -- "${exec_cmd[@]}" || exit_code=$?
     fi
     if (( exit_code == 0 )); then
       uuid="$(runner_last_id)"
@@ -301,12 +343,19 @@ github_api_exec_with_rate_limit_retry() {
       return 0
     fi
     detail="$(_github_api_last_stderr_summary)"
+    # A killed attempt (timeout(1) exits 124, or 137 once --kill-after escalates) is a transient failure like
+    # a dropped connection: the same bounded retry applies, and a mutation is still never repeated.
+    timed_out=0
+    if [[ -n "$attempt_timeout_s" ]] && (( exit_code == 124 || exit_code == 137 )); then
+      timed_out=1
+      detail="request timed out (attempt cap ${attempt_timeout_s}s, or the command's own timeout)"
+    fi
     if ! github_api_detail_is_rate_limited "$detail"; then
       # Transient transport failure (DNS, connection, gateway 5xx): bounded retry
       # with backoff so a brief outage does not abort a nightly run (#617).
       # Read requests only — a 5xx / timeout on a mutation could mean the write
       # landed, and re-POSTing is not safe (remote-timeouts-retries.mdc).
-      if github_api_detail_is_transient_network "$detail"; then
+      if (( timed_out )) || github_api_detail_is_transient_network "$detail"; then
         if _github_api_rl_cmd_is_write "${rl_cmd[@]}"; then
           printf 'NOTE: GITHUB_API_TRANSIENT_NETWORK_NO_RETRY label=%s reason=mutation detail=%s\n' \
             "$label" "$detail" >&2
@@ -394,7 +443,7 @@ github_api_fetch_rate_limit_headers() {
 
   exit_code=0
   # gh must stay on the runner_exec_stdout line (runner-adoption ratchet).
-  out="$(runner_exec_stdout "github-api-rate-limit include rate_limit" --probe -- gh api --include rate_limit 2>/dev/null)" \
+  out="$(runner_exec_stdout "github-api-rate-limit include rate_limit" --probe --timeout 30 -- gh api --include rate_limit 2>/dev/null)" \
     || exit_code=$?
   if (( exit_code != 0 )) && [[ -z "$out" ]]; then
     return 1
@@ -427,7 +476,7 @@ github_api_rate_limit_core_reset_epoch() {
   local out exit_code
 
   exit_code=0
-  out="$(runner_exec_stdout "github-api-rate-limit core reset" --probe -- gh api rate_limit --jq '.resources.core.reset // empty' 2>/dev/null)" \
+  out="$(runner_exec_stdout "github-api-rate-limit core reset" --probe --timeout 30 -- gh api rate_limit --jq '.resources.core.reset // empty' 2>/dev/null)" \
     || exit_code=$?
   if (( exit_code != 0 )); then
     return 1
@@ -446,7 +495,7 @@ github_api_rate_limit_depleted_reset_epoch() {
 
   exit_code=0
   # shellcheck disable=SC2016  # jq program is a literal string
-  out="$(runner_exec_stdout "github-api-rate-limit depleted reset" --probe -- gh api rate_limit --jq '[.resources.core, .resources.graphql, .resources.search] | map(select((.remaining // 0) == 0) | .reset) | if length == 0 then empty else min end' 2>/dev/null)" \
+  out="$(runner_exec_stdout "github-api-rate-limit depleted reset" --probe --timeout 30 -- gh api rate_limit --jq '[.resources.core, .resources.graphql, .resources.search] | map(select((.remaining // 0) == 0) | .reset) | if length == 0 then empty else min end' 2>/dev/null)" \
     || exit_code=$?
   if (( exit_code != 0 )); then
     return 1
@@ -987,7 +1036,7 @@ _github_api_primary_quota_available() {
 
   exit_code=0
   # shellcheck disable=SC2016  # jq program is a literal string
-  out="$(runner_exec_stdout "github-api-rate-limit primary remaining" --probe -- gh api rate_limit --jq '([.resources.core.remaining // 0, .resources.graphql.remaining // 0, .resources.search.remaining // 0] | all(. > 0))' 2>/dev/null)" \
+  out="$(runner_exec_stdout "github-api-rate-limit primary remaining" --probe --timeout 30 -- gh api rate_limit --jq '([.resources.core.remaining // 0, .resources.graphql.remaining // 0, .resources.search.remaining // 0] | all(. > 0))' 2>/dev/null)" \
     || exit_code=$?
   (( exit_code == 0 )) || return 1
   [[ "$out" == 'true' ]]
@@ -1006,7 +1055,7 @@ _github_api_quota_intact_suspect() {
   fi
   exit_code=0
   # shellcheck disable=SC2016  # jq program is a literal string
-  out="$(runner_exec_stdout "github-api-rate-limit primary remaining" --probe -- gh api rate_limit --jq '([.resources.core.remaining // 0, .resources.graphql.remaining // 0, .resources.search.remaining // 0] | all(. > 0))' 2>/dev/null)" \
+  out="$(runner_exec_stdout "github-api-rate-limit primary remaining" --probe --timeout 30 -- gh api rate_limit --jq '([.resources.core.remaining // 0, .resources.graphql.remaining // 0, .resources.search.remaining // 0] | all(. > 0))' 2>/dev/null)" \
     || exit_code=$?
   if (( exit_code != 0 )); then
     return 0
