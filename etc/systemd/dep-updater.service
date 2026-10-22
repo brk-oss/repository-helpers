@@ -22,6 +22,12 @@ EnvironmentFile=%h/.config/dep-updater.env
 TimeoutStartSec=4h 30min
 TimeoutStopSec=2min
 KillMode=control-group
+# Deliberately no sandboxing directives (#749): every unit here may mail its report through
+# sendmail(1) (DEP_UPDATER_SMTP_HOST=localhost), and Postfix/exim install it setgid/setuid.
+# NoNewPrivileges=, RestrictAddressFamilies=, SystemCallArchitectures= and the other seccomp
+# directives (SystemCallFilter=, RestrictNamespaces=, MemoryDenyWriteExecute=, ...) all force
+# no_new_privs in a user manager, the kernel then ignores the setgid bit and sendmail hangs.
+# ProtectHome=/ProtectSystem= are out too: the job writes under %h and its scan root.
 ExecStart=@@REPO_DIR@@/scripts/dep-updater-batch-run
 StandardOutput=append:%h/scratch/repository-helpers/dep-updater-batch.log
 StandardError=append:%h/scratch/repository-helpers/dep-updater-batch.log
