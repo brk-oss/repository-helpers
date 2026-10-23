@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Tests for the dep-updater --batch --all free-disk preflight (repository-helpers#768).
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# Copies named top-level functions out of dep-updater (it runs main on source, so it cannot be sourced).
+extract_functions() {
+  local fn
+  for fn in "$@"; do
+    awk -v fn="$fn" '$0 == fn "() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script"
+  done
+}
+extract_functions batch_all_free_bytes batch_all_log_has_disk_full batch_all_min_free_mb batch_all_check_free_space >"${tmp}/functions"
+# Free space is passed to the stubbed df in bytes, like the real probe asks for.
+mib() { printf '%s' "$(( $1 * 1048576 ))"; }
+
+# run_case <df-avail-mb|unreadable> [env assignments...]: runs the check against /scratch with a
+# stubbed df and prints "rc=<n>" after the combined output. Nothing touches a real filesystem.
+run_case() {
+  local -r avail="$1"
+  shift
+  env -u DEP_UPDATER_MIN_FREE_MB "$@" AVAIL="$avail" bash -c '
+    set -euo pipefail
+    source "$1"
+    log() { printf "%s\n" "$*"; }
+    die() { printf "DIE: %s\n" "$*" >&2; exit 9; }
+    df() {
+      if [[ "$AVAIL" == unreadable ]]; then return 1; fi
+      printf "Avail\n%s\n" "$AVAIL"
+    }
+    rc=0
+    batch_all_check_free_space /scratch || rc=$?
+    printf "rc=%s\n" "$rc"
+  ' _ "${tmp}/functions" 2>&1
+}
+
+printf '\n=== free-space probe ===\n'
+out="$(AVAIL=4096 bash -c 'source "$1"; df() { printf "Avail\n 4096\n"; }; batch_all_free_bytes /x' _ "${tmp}/functions")"
+assert_contains "free space is read in bytes from df --output=avail" "$out" "4096"
+out="$(bash -c 'source "$1"; df() { return 1; }; printf "[%s]" "$(batch_all_free_bytes /x)"' _ "${tmp}/functions")"
+assert_contains "an unreadable df result gives an empty value" "$out" "[]"
+out="$(bash -c 'source "$1"; df() { printf "Avail\nnot-a-number\n"; }; printf "[%s]" "$(batch_all_free_bytes /x)"' _ "${tmp}/functions")"
+assert_contains "a non-numeric df result gives an empty value" "$out" "[]"
+
+printf '\n=== threshold ===\n'
+out="$(run_case "$(mib 3072)")"
+assert_contains "exactly the default 3072 MiB passes" "$out" "rc=0"
+out="$(run_case "$(mib 3071)")"
+assert_contains "one MiB under the default 3072 fails" "$out" "rc=1"
+out="$(run_case "$(mib 500)" DEP_UPDATER_MIN_FREE_MB=400)"
+assert_contains "DEP_UPDATER_MIN_FREE_MB lowers the threshold" "$out" "rc=0"
+out="$(run_case "$(mib 5000)" DEP_UPDATER_MIN_FREE_MB=999999999)" || true
+assert_contains "nine digits is the largest accepted threshold" "$out" "required_mb=999999999"
+out="$(run_case "$(mib 5000)" DEP_UPDATER_MIN_FREE_MB=6000)"
+assert_contains "DEP_UPDATER_MIN_FREE_MB raises the threshold" "$out" "required_mb=6000"
+for bad in 0 abc -5 1.5 1234567890; do
+  out="$(run_case "$(mib 5000)" DEP_UPDATER_MIN_FREE_MB="$bad")" || true
+  assert_contains "DEP_UPDATER_MIN_FREE_MB='${bad}' is an error" "$out" "DIE: DEP_UPDATER_MIN_FREE_MB must be a positive integer"
+done
+
+out="$(run_case "$(( 3072 * 1048576 - 1 ))")"
+assert_contains "one byte under the threshold fails, not rounded up to pass" "$out" "rc=1"
+assert_contains "one byte under 3072 MiB reports 3071 MiB free" "$out" "free_mb=3071"
+out="$(run_case "$(( 3072 * 1048576 + 1 ))")"
+assert_contains "one byte over the threshold passes" "$out" "rc=0"
+
+printf '\n=== child log probe ===\n'
+printf 'one\nerror: No space left on device\nthree\n' >"${tmp}/full.log"
+printf 'one\ntwo\n' >"${tmp}/ok.log"
+: >"${tmp}/empty.log"
+for case_file in full:0 ok:1 empty:1; do
+  name="${case_file%%:*}"
+  want="${case_file##*:}"
+  got=0
+  bash -c 'source "$1"; batch_all_log_has_disk_full "$2"' _ "${tmp}/functions" "${tmp}/${name}.log" || got=$?
+  assert_contains "the ${name} log probe exits ${want}" "got=${got}" "got=${want}"
+done
+
+printf '\n=== preflight ===\n'
+out="$(run_case "$(mib 100)")"
+assert_contains "low disk prints the machine-parseable line" "$out" \
+  "ERROR: LOW_DISK_SPACE path=/scratch free_mb=100 required_mb=3072"
+assert_count_equals "low disk prints exactly one ERROR line" "$out" "ERROR:" 1
+assert_contains "low disk returns non-zero" "$out" "rc=1"
+out="$(run_case "$(mib 100000)")"
+assert_not_contains "enough disk prints no error" "$out" "ERROR:"
+assert_contains "enough disk returns zero" "$out" "rc=0"
+out="$(run_case unreadable)"
+assert_contains "an unreadable df result is a NOTE" "$out" "could not read free disk space under /scratch"
+assert_contains "an unreadable df result never blocks the run" "$out" "rc=0"
+assert_not_contains "an unreadable df result is not an ERROR" "$out" "ERROR:"
+
+printf '\n=== email: a child disk error is the cause ===\n'
+batch_run="${script_dir}/../scripts/dep-updater-batch-run"
+awk '$0 == "batch_report_append_repo_failure_details() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$batch_run" >"${tmp}/email-fn"
+clean_log="${tmp}/clean.log"
+cat >"$clean_log" <<'LOG'
+[batch-all]   alpha: LOW_DISK_SPACE: 'No space left on device' in the child log; free disk space on the batch host (temp dir: /tmp) and re-run
+[batch-all]   alpha: pr=#900 shellcheck (FAILURE)
+[batch-all] CI failure (alpha): pr=#900 shellcheck (FAILURE)
+LOG
+out="$(bash -c '
+  set -euo pipefail
+  source "$1"
+  lines=()
+  batch_report_append_repo_failure_details alpha "$2" /tmp/x.log lines
+  printf "%s\n" "${lines[@]}"
+' _ "${tmp}/email-fn" "$clean_log" 2>&1)"
+assert_contains "the email cause names LOW_DISK_SPACE" "$out" "Cause: LOW_DISK_SPACE:"
+assert_not_contains "the email does not report the downstream CI symptom" "$out" "CI failed"
+
+printf '\n=== static: wiring ===\n'
+reap_line="$(grep -n 'batch_all_reap_stale_ephemeral_roots "\$ephemeral_base"' "$script" | tail -n 1 | cut -d: -f1)"
+check_line="$(grep -n 'batch_all_check_free_space "\$ephemeral_base" || return 1' "$script" | cut -d: -f1)"
+mktemp_line="$(grep -n 'mktemp -d "\${ephemeral_base}/dep-updater-batch-clones.XXXXXX"' "$script" | cut -d: -f1)"
+discover_line="$(grep -n 'discover_file="\$(mktemp)"' "$script" | head -n 1 | cut -d: -f1)"
+if [[ -n "$reap_line" && -n "$check_line" && -n "$mktemp_line" && -n "$discover_line" ]] \
+  && (( reap_line < check_line && check_line < discover_line && discover_line < mktemp_line )); then
+  pass_case "the preflight runs after the stale-clone reaper and before the first temp file (discovery list) and the clone root"
+else
+  fail_case "the preflight runs after the stale-clone reaper and before the first temp file (discovery list) and the clone root (reap=${reap_line:-?} check=${check_line:-?} mktemp=${mktemp_line:-?})"
+fi
+tmpdir_check_line="$(grep -n 'batch_all_check_free_space "\${TMPDIR:-/tmp}" || return 1' "$script" | head -n 1 | cut -d: -f1)"
+if [[ -n "$tmpdir_check_line" && -n "$check_line" && -n "$discover_line" ]] \
+  && (( check_line < tmpdir_check_line && tmpdir_check_line < discover_line )); then
+  pass_case "the preflight also checks \$TMPDIR (plain mktemp) before the first temp file when --tmpdir differs"
+else
+  fail_case "the preflight also checks \$TMPDIR (plain mktemp) before the first temp file when --tmpdir differs (line=${tmpdir_check_line:-?})"
+fi
+detect_line="$(grep -n 'if batch_all_log_has_disk_full "\$child_log"; then' "$script" | head -n 1 | cut -d: -f1)"
+clean_alloc_line="$(grep -n 'child_clean="\$(mktemp)"' "$script" | head -n 1 | cut -d: -f1)"
+if [[ -n "$detect_line" && -n "$clean_alloc_line" ]] && (( detect_line < clean_alloc_line )); then
+  pass_case "the child disk-full detection reads the raw log before child_clean is allocated"
+else
+  fail_case "the child disk-full detection reads the raw log before child_clean is allocated (detect=${detect_line:-?} alloc=${clean_alloc_line:-?})"
+fi
+override="$(grep -n 'if (( child_disk_full == 1 )); then' "$script" | cut -d: -f1 | head -n 1)"
+fallback="$(grep -n "root_cause=\"\$(tail -n 1 \"\$child_clean\"" "$script" | cut -d: -f1 | head -n 1)"
+if [[ -n "$override" && -n "$fallback" ]] && (( override < fallback )); then
+  pass_case "a child log with 'No space left on device' sets the root cause before the log-tail fallback"
+else
+  fail_case "a child log with 'No space left on device' sets the root cause before the log-tail fallback"
+fi
+assert_contains "the child override names LOW_DISK_SPACE" "$(cat "$script")" 'root_cause="LOW_DISK_SPACE:'
+assert_contains "AGENTS.md documents the preflight" "$(cat "${script_dir}/../AGENTS.md")" "DEP_UPDATER_MIN_FREE_MB"
+assert_contains "dep-updater-batch-run explains a low-disk stop in the email" \
+  "$(cat "${script_dir}/../scripts/dep-updater-batch-run")" "ERROR: LOW_DISK_SPACE"
+
+batch_run_src="$(cat "${script_dir}/../scripts/dep-updater-batch-run")"
+assert_contains "the email keeps the ERROR prefix on the preflight line" "$batch_run_src" 'low_disk_line="ERROR: ${low_disk_scan#*ERROR: }"'
+first_body="$(grep -n 'body_lines+=("\$low_disk_line")' "${script_dir}/../scripts/dep-updater-batch-run" | head -n 1 | cut -d: -f1)"
+explain="$(grep -n 'stopped before it started: the temp filesystem is nearly full' "${script_dir}/../scripts/dep-updater-batch-run" | head -n 1 | cut -d: -f1)"
+if [[ -n "$first_body" && -n "$explain" ]] && (( first_body < explain )); then
+  pass_case "the email puts the preflight line before the explanation"
+else
+  fail_case "the email puts the preflight line before the explanation (line=${first_body:-?} explanation=${explain:-?})"
+fi
+
+test_summary
