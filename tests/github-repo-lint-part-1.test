@@ -93,7 +93,6 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_validate_ruleset_code_owner_review' "$lib" \
   && grep -qF 'rp_check_main_commit_verification' "$lib" \
   && grep -qF 'cleanup-merged-branches.yml' "$lib" \
-  && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib" \
   && grep -qF 'rp_gh_path_check' "$lib" \
   && grep -qF 'rp_gh_api_detail_is_not_found' "$lib" \
   && grep -qF 'rp_gh_api_detail_is_transient' "$lib"; then
@@ -979,20 +978,16 @@ else
 fi
 rm -rf "$cve_skip_tmp"
 
-printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
+printf '\n=== static: cleanup-merged-branches no longer sweeps Graphite branches (#772) ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
-if grep -qF 'gtmq_batch_' "$gtmq_template" \
-  && grep -qF 'gtmq_merge_' "$gtmq_template" \
-  && grep -qF 'gtmq_base_no_ci_batch_' "$gtmq_template" \
-  && grep -qF 'graphite-base/*' "$gtmq_template" \
-  && grep -qF 'repo-practices/*' "$gtmq_template" \
+if grep -qF 'repo-practices/*' "$gtmq_template" \
   && grep -qF "7 days ago" "$gtmq_template" \
   && grep -qF 'delete_branch_ref' "$gtmq_template" \
-  && grep -qF 'is_graphite_mq_branch' "$gtmq_template"; then
-  printf '[PASS] cleanup-merged-branches template sweeps Graphite ephemeral branches\n'
+  && ! grep -qiE 'graphite|gtmq' "$gtmq_template"; then
+  printf '[PASS] cleanup-merged-branches template sweeps merged and stale branches without Graphite special cases\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] cleanup-merged-branches template missing Graphite ephemeral branch sweep\n'
+  printf '[FAIL] cleanup-merged-branches template still mentions Graphite or lost a sweep rule\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1089,13 +1084,13 @@ cmb_output="$(
 )" || cmb_status=$?
 cmb_deleted="$(sort "${cmb_tmp}/deleted.log" | tr '\n' ' ')"
 if [[ "$cmb_status" -eq 0 ]] \
-  && [[ "$cmb_deleted" == 'feature/merged graphite-base/stack-1 repo-practices/old-closed ' ]] \
-  && grep -qF 'Deleted 3 branches; kept 8 branches.' <<<"$cmb_output" \
+  && [[ "$cmb_deleted" == 'feature/merged repo-practices/old-closed ' ]] \
+  && grep -qF 'Deleted 2 branches; kept 9 branches.' <<<"$cmb_output" \
   && grep -qF 'Could not look up open PRs for graphite-base/lookup-fails; keeping it.' <<<"$cmb_output"; then
-  printf '[PASS] cleanup-merged-branches deletes only merged, stale-superseded and Graphite branches, and keeps a branch whose PR lookup failed\n'
+  printf '[PASS] cleanup-merged-branches deletes only merged and stale-superseded branches (a leftover graphite-base branch is kept), and keeps a branch whose PR lookup failed\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] cleanup-merged-branches sweep exit %s, deleted [%s] (expected merged, old repo-practices and graphite-base only; forks, deleted forks, open, fresh and lookup-failed branches kept); output: %s\n' \
+  printf '[FAIL] cleanup-merged-branches sweep exit %s, deleted [%s] (expected merged and old repo-practices only; forks, deleted forks, open, fresh and lookup-failed branches kept); output: %s\n' \
     "$cmb_status" "$cmb_deleted" "$cmb_output"
   fail=$(( fail + 1 ))
 fi
@@ -1127,7 +1122,7 @@ cmb_del_output="$(
 )" || cmb_del_status=$?
 cmb_del_deleted="$(sort "${cmb_tmp}/deleted.log" | tr '\n' ' ')"
 if [[ "$cmb_del_status" -ne 0 ]] \
-  && [[ "$cmb_del_deleted" == 'graphite-base/stack-1 repo-practices/old-closed ' ]] \
+  && [[ "$cmb_del_deleted" == 'repo-practices/old-closed ' ]] \
   && grep -qF 'Failed to delete feature/merged' <<<"$cmb_del_output" \
   && grep -qF 'Failed to delete 1 branch(es).' <<<"$cmb_del_output"; then
   printf '[PASS] cleanup-merged-branches finishes the sweep but exits non-zero when a delete fails\n'
@@ -1138,44 +1133,78 @@ else
 fi
 rm -rf "$cmb_tmp"
 
-printf '\n=== static: merged-pr-closer closes stale Graphite MQ drafts ===\n'
+printf '\n=== static: merged-pr-closer closes merged PRs without Graphite handling (#772) ===\n'
 closer_template="${templates_dir}/merged-pr-closer.yml"
-if grep -qF 'gtmq_batch_' "$closer_template" \
-  && grep -qF '[Graphite MQ] Draft PR GROUP' "$closer_template" \
-  && grep -qE '^  push:' "$closer_template" \
-  && grep -qF 'graphite-app' "$closer_template" \
-  && grep -qF 'Graphite merge queue' "$closer_template" \
+if grep -qE '^  push:' "$closer_template" \
   && grep -qF 'delete_head_branch' "$closer_template" \
-  && grep -qF 'contents: write' "$closer_template"; then
-  printf '[PASS] merged-pr-closer template closes stale Graphite MQ draft group PRs\n'
+  && grep -qF 'contents: write' "$closer_template" \
+  && grep -qF 'compare/' "$closer_template" \
+  && grep -qF 'DEFAULT_BRANCH' "$closer_template" \
+  && grep -qF 'head_repo' "$closer_template" \
+  && grep -qF 'timeout-minutes' "$closer_template" \
+  && grep -qF '= "behind"' "$closer_template" \
+  && ! grep -qF 'identical' "$closer_template" \
+  && ! grep -qiE 'graphite|gtmq' "$closer_template"; then
+  printf '[PASS] merged-pr-closer template closes landed PRs and has no Graphite handling\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] merged-pr-closer template missing stale Graphite MQ draft cleanup\n'
+  printf '[FAIL] merged-pr-closer template lost a rule or still mentions Graphite\n'
   fail=$(( fail + 1 ))
 fi
 
 if grep -qF 'rp_merged_pr_closer_workflow_has_push_to_main_trigger' "$lib" \
-  && grep -qF 'rp_merged_pr_closer_workflow_has_mq_draft_cleanup' "$lib" \
   && grep -qF 'rp_merged_pr_closer_workflow_deletes_head_branch' "$lib" \
-  && grep -qF 'merged-pr-closer.yml must run on main push, close stale Graphite MQ drafts, and delete head branches' "$lib"; then
-  printf '[PASS] repo-practices lint enforces stale Graphite MQ draft cleanup\n'
+  && ! grep -qF 'rp_merged_pr_closer_workflow_has_mq_draft_cleanup' "$lib" \
+  && grep -qF 'merged-pr-closer.yml must run on main push and delete head branches' "$lib"; then
+  printf '[PASS] repo-practices lint requires the main-push trigger and branch deletion, not Graphite MQ drafts\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] repo-practices should lint merged-pr-closer MQ draft cleanup\n'
+  printf '[FAIL] repo-practices merged-pr-closer lint still requires Graphite MQ draft cleanup\n'
   fail=$(( fail + 1 ))
 fi
 
-legacy_closer='name: Close Graphite-Merged PRs
-on:
-  issue_comment:
-    types: [created]
-'
-if grep -qF 'gtmq_batch_' <<<"$legacy_closer"; then
-  printf '[FAIL] legacy comment-trigger closer should not pass MQ draft cleanup check\n'
-  fail=$(( fail + 1 ))
-else
-  printf '[PASS] legacy comment-trigger closer lacks MQ draft cleanup markers\n'
+printf '\n=== unit: main-push and main-ignore matchers use whole branch names (#772) ===\n'
+main_match_out="$(
+  bash -c '
+    set -uo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    closer="$2"
+    probe() {
+      local rc=0
+      "$@" >/dev/null 2>&1 || rc=$?
+      printf "%s" "$rc"
+    }
+    inline=$'"'"'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n'"'"'
+    block=$'"'"'on:\n  push:\n    branches:\n      - main\n'"'"'
+    other=$'"'"'# runs on main\non:\n  push:\n    branches: [release]\n'"'"'
+    ignored=$'"'"'on:\n  push:\n    branches-ignore:\n      - main\n'"'"'
+    commented=$'"'"'on:\n  push: # trigger\n    branches: # list\n      - main  # protected\n'"'"'
+    printf "template=%s inline=%s block=%s other=%s ignored=%s\n" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$(cat "$closer")")" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$inline")" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$block")" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$other")" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$ignored")"
+    printf "commented=%s\n" \
+      "$(probe rp_merged_pr_closer_workflow_has_push_to_main_trigger "$commented")"
+    real=$'"'"'on:\n  push:\n    branches-ignore:\n      - main\n'"'"'
+    domain=$'"'"'on:\n  push:\n    branches-ignore:\n      - domain\n'"'"'
+    inline_ignore=$'"'"'on:\n  push:\n    branches-ignore: [main]\n'"'"'
+    printf "ignore_main=%s ignore_domain=%s ignore_inline=%s\n" \
+      "$(probe rp_ci_workflow_has_feature_branch_push_trigger "$real")" \
+      "$(probe rp_ci_workflow_has_feature_branch_push_trigger "$domain")" \
+      "$(probe rp_ci_workflow_has_feature_branch_push_trigger "$inline_ignore")"
+  ' bash "$lib" "$closer_template" 2>&1
+)"
+if grep -qF 'template=0 inline=0 block=0 other=1 ignored=1' <<<"$main_match_out" \
+  && grep -qF 'ignore_main=0 ignore_domain=1 ignore_inline=0' <<<"$main_match_out" \
+  && grep -qF 'commented=0' <<<"$main_match_out"; then
+  printf '[PASS] main matchers accept the canonical push-to-main forms and reject look-alikes\n'
   pass=$(( pass + 1 ))
+else
+  printf '[FAIL] main matchers (%s)\n' "$main_match_out"
+  fail=$(( fail + 1 ))
 fi
 
 printf '\n=== functional: --merge-only skips branch cleanup failure ===\n'

@@ -7,7 +7,6 @@
 
 rp_DEFAULT_ORG='the-hcma'
 rp_GRAPHITE_APP_ACTOR_ID=158384
-rp_GRAPHITE_APP_SLUG='graphite-app'
 rp_DEPENDABOT_APP_SLUG='dependabot'
 # protect-main ruleset bypass actor for the org owner. actor_id 1 with actor_type
 # "OrganizationAdmin" is GitHub's fixed handle for the org-admin role. bypass_mode
@@ -3657,15 +3656,28 @@ rp_candidate_merged_pr_closer_workflow() {
   rp_candidate_workflow_template 'merged-pr-closer.yml'
 }
 
+# True when the workflow's top-level `push:` trigger lists `main` under `branches:`, either
+# inline (`branches: [main]`) or as a block item (`- main`). A `main` elsewhere in the file
+# (a comment, a run step, `branches-ignore`) does not count.
 rp_merged_pr_closer_workflow_has_push_to_main_trigger() {
   local text="$1"
-  grep -qE '^  push:' <<<"$text" && grep -qF 'main' <<<"$text"
-}
-
-rp_merged_pr_closer_workflow_has_mq_draft_cleanup() {
-  local text="$1"
-  grep -qF 'gtmq_batch_' <<<"$text" \
-    && grep -qF '[Graphite MQ] Draft PR GROUP' <<<"$text"
+  awk -v sq="'" '
+    BEGIN {
+      item_re = "^[[:space:]]*-[[:space:]]*[\"" sq "]?main[\"" sq "]?([[:space:]]+#.*)?[[:space:]]*$"
+    }
+    /^  push:([[:space:]]+#.*)?[[:space:]]*$/ { in_push = 1; in_branches = 0; next }
+    in_push && /^  [^[:space:]]/ { in_push = 0; in_branches = 0 }
+    in_push && /^[^[:space:]]/ { in_push = 0; in_branches = 0 }
+    in_push && /^    branches:[[:space:]]*\[/ {
+      if ($0 ~ ("[\\[,][[:space:]]*[\"" sq "]?main[\"" sq "]?[[:space:]]*[],]")) { found = 1 }
+      in_branches = 0
+      next
+    }
+    in_push && /^    branches:([[:space:]]+#.*)?[[:space:]]*$/ { in_branches = 1; next }
+    in_push && /^    [^[:space:]-]/ { in_branches = 0 }
+    in_push && in_branches && $0 ~ item_re { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$text"
 }
 
 rp_merged_pr_closer_workflow_deletes_head_branch() {
@@ -3682,12 +3694,6 @@ rp_candidate_cleanup_merged_branches_workflow() {
   rp_candidate_workflow_template 'cleanup-merged-branches.yml'
 }
 
-rp_cleanup_merged_branches_workflow_is_canonical() {
-  local text="$1"
-  local canonical
-  canonical="$(rp_candidate_cleanup_merged_branches_workflow)"
-  [[ "$text" == "$canonical" ]]
-}
 
 rp_candidate_dependabot_auto_merge_workflow() {
   rp_candidate_workflow_template 'dependabot-auto-merge.yml'
@@ -4753,15 +4759,16 @@ rp_ci_workflow_has_pull_request_edited_type() {
 
 rp_ci_workflow_has_feature_branch_push_trigger() {
   local text="$1"
-  awk '
+  awk -v sq="'" '
     BEGIN {
+      item_re = "^[[:space:]]*-[[:space:]]*[\"" sq "]?main[\"" sq "]?([[:space:]]+#.*)?[[:space:]]*$"
+      inline_re = "[\\[,][[:space:]]*[\"" sq "]?main[\"" sq "]?[[:space:]]*[],]"
       in_on = 0
       in_push = 0
       push_indent = -1
       in_branches_ignore = 0
       branches_ignore_indent = -1
       has_main_ignore = 0
-      has_graphite_ignore = 0
     }
     /^on:[[:space:]]*$/ { in_on = 1; next }
     in_on && /^[^[:space:]]/ { in_on = 0; in_push = 0; in_branches_ignore = 0 }
@@ -4777,6 +4784,10 @@ rp_ci_workflow_has_feature_branch_push_trigger() {
         in_branches_ignore = 0
         next
       }
+      if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*\[/) {
+        if ($0 ~ inline_re) { has_main_ignore = 1 }
+        next
+      }
       if ($0 ~ /^[[:space:]]*branches:[[:space:]]*\[[[:space:]]*main/) {
         exit 1
       }
@@ -4790,11 +4801,10 @@ rp_ci_workflow_has_feature_branch_push_trigger() {
           in_branches_ignore = 0
           next
         }
-        if ($0 ~ /main/) { has_main_ignore = 1 }
-        if ($0 ~ /graphite-base/) { has_graphite_ignore = 1 }
+        if ($0 ~ item_re) { has_main_ignore = 1 }
       }
     }
-    END { exit((has_main_ignore && has_graphite_ignore) ? 0 : 1) }
+    END { exit(has_main_ignore ? 0 : 1) }
   ' <<<"$text"
 }
 
@@ -8148,7 +8158,7 @@ rp_print_new_repo_checklist() {
       [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists;
           enable auto-merge squash — not merge-it labels)
       [ ] cve-check.yml (daily pip-audit CVE check for uv+pyproject repos)
-      [ ] merged-pr-closer.yml (optional hygiene for leftover Graphite MQ drafts)
+      [ ] merged-pr-closer.yml (closes PRs that already landed on main)
 
     Dependency release age (scripts/lib/release-age-defaults):
       [ ] dependabot.yml: cooldown default-days: ${release_age_dependabot_days} on every updates entry
@@ -8569,7 +8579,7 @@ rp_validate_graphite_workflows() {
           'chore: add merged-pr-closer workflow'
       fi
       if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add merged-pr-closer.yml (closes merged PRs and stale Graphite MQ draft group PRs)"
+        rp_log_suggest "${slug}: add merged-pr-closer.yml (closes PRs that already landed on main)"
       fi
       fail=1
     else
@@ -8582,27 +8592,18 @@ rp_validate_graphite_workflows() {
     if (( fetch_ec == 2 )); then
       rp_log_gh_api_fail "$slug" 'could not read .github/workflows/merged-pr-closer.yml'
       fail=1
-    elif [[ -z "$closer_text" ]] \
-      || ! grep -qF "${rp_GRAPHITE_APP_SLUG}" <<<"$closer_text" \
-      || ! grep -qF 'Graphite merge queue' <<<"$closer_text"; then
-      rp_log_fail "${slug}: merged-pr-closer.yml must detect ${rp_GRAPHITE_APP_SLUG} Graphite merge queue comments"
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" '.github/workflows/merged-pr-closer.yml' \
-          "$(rp_candidate_merged_pr_closer_workflow)" \
-          'add-merged-pr-closer' \
-          'chore: update merged-pr-closer workflow'
-      fi
+    elif [[ -z "$closer_text" ]]; then
+      rp_log_fail "${slug}: merged-pr-closer.yml is empty"
       fail=1
     elif [[ "$strict" == '1' ]] \
       && { ! rp_merged_pr_closer_workflow_has_push_to_main_trigger "$closer_text" \
-        || ! rp_merged_pr_closer_workflow_has_mq_draft_cleanup "$closer_text" \
         || ! rp_merged_pr_closer_workflow_deletes_head_branch "$closer_text"; }; then
-      rp_log_fail "${slug}: merged-pr-closer.yml must run on main push, close stale Graphite MQ drafts, and delete head branches"
+      rp_log_fail "${slug}: merged-pr-closer.yml must run on main push and delete head branches"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_queue_candidate_file_fix "$slug" '.github/workflows/merged-pr-closer.yml' \
           "$(rp_candidate_merged_pr_closer_workflow)" \
-          'update-merged-pr-closer-mq-draft' \
-          'chore: update merged-pr-closer for stale Graphite MQ drafts'
+          'update-merged-pr-closer' \
+          'chore: update merged-pr-closer workflow'
       fi
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: sync merged-pr-closer.yml from scripts/lib/repo-practices-workflows"
@@ -8623,16 +8624,6 @@ rp_validate_graphite_workflows() {
       rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
       fail=1
       ci_text=""
-    elif [[ -z "$ci_text" ]] || ! grep -qF 'gtmq_merge_' <<<"$ci_text"; then
-      if [[ "$strict" == '1' ]]; then
-        rp_log_fail "${slug}: ci.yml must skip gtmq_merge_* merge-queue staging branches"
-        if [[ "$rp_suggest" -eq 1 ]]; then
-          rp_log_suggest "${slug}: add a guard job that sets skip=true when head_ref matches gtmq_merge_*"
-        fi
-        fail=1
-      else
-        rp_log_warn "${slug}: ci.yml does not skip gtmq_merge_* (recommended when using Graphite MQ)"
-      fi
     fi
 
     if [[ -n "${ci_text:-}" ]]; then
@@ -8829,19 +8820,6 @@ rp_validate_branch_cleanup_workflows() {
           "$(rp_candidate_cleanup_merged_branches_workflow)" \
           'add-cleanup-merged-branches' \
           'chore: update merged branch cleanup workflow'
-      fi
-      fail=1
-    elif rp_repo_has_merge_it_label "$slug" \
-      && ! rp_cleanup_merged_branches_workflow_is_canonical "$sweep_text"; then
-      rp_log_fail "${slug}: cleanup-merged-branches.yml must match canonical template"
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" '.github/workflows/cleanup-merged-branches.yml' \
-          "$(rp_candidate_cleanup_merged_branches_workflow)" \
-          'sync-cleanup-merged-branches' \
-          'chore: sync cleanup-merged-branches workflow'
-      fi
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: sync cleanup-merged-branches.yml (scripts/github-repo-lint --apply-fix)"
       fi
       fail=1
     fi
