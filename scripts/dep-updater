@@ -7001,22 +7001,58 @@ rust_outdated() {
   return "$rows_rc"
 }
 
+# _rust_append_last_stdout <file>
+# Appends the stdout of the most recent runner command to <file>, byte for byte. Unlike dep_runner_last_stdout it
+# fails when there is no last run or its artifact cannot be read, so a missing listing is never an empty one.
+_rust_append_last_stdout() {
+  local -r target="$1"
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 1
+  runner_read "$uuid" stdout >>"$target"
+}
+
 # _rust_dirty_paths <worktree_dir>
-# The Cargo.toml / Cargo.lock / *.rs paths (workspace members included) that differ from HEAD, staged or not.
-# Returns 1 when either git probe fails, so a caller never mistakes an unreadable worktree for a clean one.
+# The Cargo.toml / Cargo.lock / *.rs paths (workspace members included) that differ from HEAD, staged or not,
+# NUL-delimited on stdout: git quotes a path with non-ASCII bytes, `"`, `\` or a control character unless it is
+# asked for `-z`, and a quoted member manifest would no longer match the `*/Cargo.toml` filter (#821). Bash
+# variables cannot hold NUL, so the git output stays in a file and is read back with `read -d ''`.
+# Returns 1 when either git probe, the sort or writing the listing fails, so a caller never mistakes an unreadable worktree for a clean one.
 _rust_dirty_paths() {
   local -r cargo_dir="$1"
-  local f unstaged staged
+  local f listing
+  local rc=0
 
-  unstaged="$(dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD)" || return 1
-  staged="$(dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only)" || return 1
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
+  listing="$(mktemp)"
+  if ! runner_exec "git worktree" -- git -C "$cargo_dir" diff -z --name-only HEAD; then
+    rm -f "$listing"
+    return 1
+  fi
+  if ! _rust_append_last_stdout "$listing"; then
+    rm -f "$listing"
+    return 1
+  fi
+  if ! runner_exec "git worktree" -- git -C "$cargo_dir" diff -z --cached --name-only; then
+    rm -f "$listing"
+    return 1
+  fi
+  if ! _rust_append_last_stdout "$listing"; then
+    rm -f "$listing"
+    return 1
+  fi
+  if ! sort -zu --output="${listing}.sorted" "$listing"; then
+    rm -f "$listing" "${listing}.sorted"
+    return 1
+  fi
+  while IFS= read -r -d '' f; do
     case "$f" in
-      *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\n' "$f" ;;
+      *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\0' "$f" || rc=1 ;;
       *) continue ;;
     esac
-  done < <(printf '%s\n%s\n' "$unstaged" "$staged" | sort -u)
+  done <"${listing}.sorted" || rc=1
+  rm -f "$listing" "${listing}.sorted"
+  return "$rc"
 }
 
 # rust_revert_post_bump_workdir <worktree_dir>
@@ -7027,29 +7063,37 @@ _rust_dirty_paths() {
 # reverting these paths does not discard unrelated WIP.
 # Returns 1 with one machine-parseable ERROR: RUST_REVERT_INCOMPLETE line when a Rust path still differs from
 # HEAD afterwards: a later `git add -u` would stage that leftover edit into a PR as an unreported Rust change,
-# so the callers abort instead of carrying on (#813).
+# so the callers abort instead of carrying on (#813). Each path is restored with --literal-pathspecs, so a name
+# that looks like pathspec magic (`:(exclude)x.rs`) restores only itself and never another ecosystem's staged
+# edit, and in the report `\`, a newline, a carriage return and `,` are escaped so the line stays one line.
 rust_revert_post_bump_workdir() {
   local -r cargo_dir="$1"
-  local f dirty leftover=''
+  local f dirty_file escaped leftover=''
 
-  if ! dirty="$(_rust_dirty_paths "$cargo_dir")"; then
+  dirty_file="$(mktemp)"
+  if ! _rust_dirty_paths "$cargo_dir" >"$dirty_file"; then
+    rm -f "$dirty_file"
     log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=unreadable (git could not list the changed paths)"
     return 1
   fi
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
+  while IFS= read -r -d '' f; do
+    run_command "git worktree" git --literal-pathspecs -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
       2>/dev/null || true
-  done <<<"$dirty"
+  done <"$dirty_file"
 
-  if ! dirty="$(_rust_dirty_paths "$cargo_dir")"; then
+  if ! _rust_dirty_paths "$cargo_dir" >"$dirty_file"; then
+    rm -f "$dirty_file"
     log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=unreadable (git could not list the changed paths)"
     return 1
   fi
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    leftover="${leftover:+${leftover},}${f}"
-  done <<<"$dirty"
+  while IFS= read -r -d '' f; do
+    escaped="${f//\\/\\\\}"
+    escaped="${escaped//$'\n'/\\n}"
+    escaped="${escaped//$'\r'/\\r}"
+    escaped="${escaped//,/\\,}"
+    leftover="${leftover:+${leftover},}${escaped}"
+  done <"$dirty_file"
+  rm -f "$dirty_file"
   if [[ -n "$leftover" ]]; then
     log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=${leftover}"
     return 1
