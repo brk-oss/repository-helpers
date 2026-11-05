@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Tests for skipping the org-wide repo-practices audit in pre-pr-checks when nothing it reads has changed (#824).
+# Two worktrees each ran a full org audit against one shared API budget; a passing run is now recorded with a
+# fingerprint (org-wide templates at HEAD plus every org repo's default-branch SHA) and reused for a few hours.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+# shellcheck disable=SC1091
+source "${script_dir}/../scripts/lib/runner-bootstrap"
+# shellcheck disable=SC1091
+source "${script_dir}/../scripts/lib/pre-pr-ecosystem"
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+fixture="${work_dir}/repo"
+mkdir -p "${fixture}/scripts/lib/repo-practices-agents"
+(
+  cd "$fixture"
+  git init -q
+  git config user.email 'test@example.com'
+  git config user.name 'Test'
+  printf '#!/usr/bin/env bash\n' >scripts/github-repo-lint
+  printf 'template v1\n' >scripts/lib/repo-practices-agents/rule.md
+  # shellcheck disable=SC2016  # the fake helper must read the variable when it runs, not now
+  printf '#!/usr/bin/env bash\ncat -- "$FAKE_REMOTE_FILE" || exit 1\n' >scripts/gh-api
+  chmod +x scripts/gh-api
+  git add -A
+  git commit -q -m init
+)
+
+export FAKE_REMOTE_FILE="${work_dir}/remote.txt"
+unset PRE_PR_CHECKS_ORG_LINT_CACHE_TTL
+export PRE_PR_CHECKS_CACHE_DIR="${work_dir}/cache"
+printf 'the-hcma/a sha-a1\nthe-hcma/b sha-b1\n' >"$FAKE_REMOTE_FILE"
+
+# Stubs for the parts that touch GitHub or the diff; the fingerprint and the cache are the real code.
+runs_file="${work_dir}/runs"
+: >"$runs_file"
+lint_rc=0
+# count_runs — how many audits have run (a file, because run_job captures output in a subshell).
+count_runs() { wc -l <"$runs_file" | tr -d ' '; }
+gh_slug_from_repo_dir() { printf 'the-hcma/repository-helpers\n'; }
+prec_org_wide_lint_trigger() { printf 'scripts/lib/repo-practices-agents/rule.md\n'; }
+run_command() {
+  printf 'run\n' >>"$runs_file"
+  return "$lint_rc"
+}
+
+# run_job — runs the audit job; leaves its output in job_out and its exit status in job_rc.
+run_job() {
+  job_rc=0
+  job_out="$(prec_run_repo_practices_lint "$fixture" 2>&1)" || job_rc=$?
+}
+
+printf '\n=== the first run audits the org and records the pass ===\n'
+run_job
+assert_contains 'the audit runs' "$job_out" 'running org-wide'
+assert_contains 'the audit ran once' "runs=$(count_runs)" 'runs=1'
+assert_contains 'the job passes' "rc=${job_rc}" 'rc=0'
+assert_contains 'the pass is recorded' "$(ls "${work_dir}/cache")" 'org-lint-pass.the-hcma'
+
+printf '\n=== an unchanged set of main SHAs skips the audit ===\n'
+run_job
+assert_contains 'the skip is announced with the reason' "$job_out" 'skipped org-wide audit'
+assert_contains 'the skip names how to force the audit' "$job_out" 'PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=0'
+assert_contains 'the audit did not run again' "runs=$(count_runs)" 'runs=1'
+assert_contains 'the job passes' "rc=${job_rc}" 'rc=0'
+
+printf '\n=== a changed main SHA runs the audit ===\n'
+printf 'the-hcma/a sha-a2\nthe-hcma/b sha-b1\n' >"$FAKE_REMOTE_FILE"
+run_job
+assert_contains 'the audit runs again' "runs=$(count_runs)" 'runs=2'
+assert_not_contains 'no skip is announced' "$job_out" 'skipped org-wide audit'
+
+printf '\n=== a new org repository runs the audit ===\n'
+printf 'the-hcma/a sha-a2\nthe-hcma/b sha-b1\nthe-hcma/c sha-c1\n' >"$FAKE_REMOTE_FILE"
+run_job
+assert_contains 'the audit runs for the new repository' "runs=$(count_runs)" 'runs=3'
+
+printf '\n=== a changed org-wide template runs the audit ===\n'
+(
+  cd "$fixture"
+  printf 'template v2\n' >scripts/lib/repo-practices-agents/rule.md
+  git commit -q -am 'change template'
+)
+run_job
+assert_contains 'the audit runs for the changed template' "runs=$(count_runs)" 'runs=4'
+run_job
+assert_contains 'the same template is skipped afterwards' "runs=$(count_runs)" 'runs=4'
+
+printf '\n=== a failing audit is not recorded ===\n'
+printf 'the-hcma/a sha-a9\n' >"$FAKE_REMOTE_FILE"
+lint_rc=1
+run_job
+assert_contains 'the failure is returned' "rc=${job_rc}" 'rc=1'
+run_job
+assert_contains 'the next run audits again instead of skipping' "runs=$(count_runs)" 'runs=6'
+lint_rc=0
+
+printf '\n=== a failing audit at an unchanged key evicts the earlier pass ===\n'
+lint_rc=0
+run_job
+runs_before="$(count_runs)"
+lint_rc=1
+printf 'x\n' >"${fixture}/scripts/lib/release-age-defaults"
+git -C "$fixture" add scripts/lib/release-age-defaults
+git -C "$fixture" commit -q -m 'age defaults'
+run_job
+lint_rc=0
+run_job
+assert_contains 'the failed audit and the run after it both audit' "runs=$(( $(count_runs) - runs_before ))" 'runs=2'
+run_job
+assert_contains 'a passing run is recorded again afterwards' "runs=$(( $(count_runs) - runs_before ))" 'runs=2'
+
+printf '\n=== an ignored untracked template edit is keyed by content ===\n'
+printf 'ignored.md\n' >>"${fixture}/.git/info/exclude"
+printf 'one\n' >"${fixture}/.agents-rules-ignored.md"
+mkdir -p "${fixture}/.agents/rules"
+printf 'one\n' >"${fixture}/.agents/rules/ignored.md"
+run_job
+runs_before="$(count_runs)"
+run_job
+assert_contains 'unchanged ignored content skips' "runs=$(( $(count_runs) - runs_before ))" 'runs=0'
+printf 'two\n' >"${fixture}/.agents/rules/ignored.md"
+run_job
+assert_contains 'edited ignored content audits' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+rm -f -- "${fixture}/.agents/rules/ignored.md" "${fixture}/.agents-rules-ignored.md"
+
+printf '\n=== an expired record runs the audit ===\n'
+run_job
+runs_before="$(count_runs)"
+cache_file="$(prec_org_lint_cache_file the-hcma)"
+read -r recorded_fp _ <"$cache_file"
+printf '%s %s\n' "$recorded_fp" "$(( EPOCHSECONDS - 90000 ))" >"$cache_file"
+run_job
+assert_contains 'a record older than the TTL does not skip' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+
+printf '\n=== a failed lookup runs the audit instead of trusting a partial key ===\n'
+runs_before="$(count_runs)"
+mv -- "${fixture}/scripts/gh-api" "${fixture}/scripts/gh-api.off"
+run_job
+mv -- "${fixture}/scripts/gh-api.off" "${fixture}/scripts/gh-api"
+assert_contains 'no gh-api helper means the audit runs' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+runs_before="$(count_runs)"
+rm -f -- "$FAKE_REMOTE_FILE"
+run_job
+printf 'the-hcma/a sha-a9\n' >"$FAKE_REMOTE_FILE"
+assert_contains 'a failing remote listing means the audit runs' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+assert_contains 'the job still passes' "rc=${job_rc}" 'rc=0'
+
+printf '\n=== TTL 0 turns the cache off and an invalid TTL is an error ===\n'
+run_job
+runs_before="$(count_runs)"
+PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=0 run_job
+assert_contains 'TTL 0 always audits' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=soon run_job
+assert_contains 'an invalid TTL fails with one line' "$job_out" 'ERROR: PRE_PR_CHECKS_ORG_LINT_CACHE_TTL must be a non-negative integer'
+assert_contains 'an invalid TTL exits 2' "rc=${job_rc}" 'rc=2'
+
+printf '\n=== an uncommitted template edit runs the audit ===\n'
+run_job
+runs_before="$(count_runs)"
+printf 'template dirty\n' >"${fixture}/scripts/lib/repo-practices-agents/rule.md"
+run_job
+assert_contains 'a dirty template is audited, not skipped' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+git -C "$fixture" checkout -q -- scripts/lib/repo-practices-agents/rule.md
+printf 'new\n' >"${fixture}/scripts/lib/repo-practices-agents/extra.md"
+runs_before="$(count_runs)"
+run_job
+assert_contains 'an untracked template is audited, not skipped' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+rm -f -- "${fixture}/scripts/lib/repo-practices-agents/extra.md"
+
+printf '\n=== a changed helpers clone runs the audit for a consumer repo ===\n'
+helpers_clone="${work_dir}/helpers"
+cp -a -- "$fixture" "$helpers_clone"
+consumer="${work_dir}/consumer"
+mkdir -p "$consumer"
+git -C "$consumer" init -q
+git -C "$consumer" config user.email 'test@example.com'
+git -C "$consumer" config user.name 'Test'
+git -C "$consumer" commit -q --allow-empty -m init
+real_resolver="$(declare -f prec_resolve_github_repo_lint_script)"
+# shellcheck disable=SC2317  # called indirectly by prec_run_repo_practices_lint
+prec_resolve_github_repo_lint_script() { printf '%s/scripts/github-repo-lint\n' "$helpers_clone"; }
+fixture="$consumer"
+run_job
+runs_before="$(count_runs)"
+run_job
+assert_contains 'an unchanged clone skips' "runs=$(( $(count_runs) - runs_before ))" 'runs=0'
+printf '# newer audit\n' >>"${helpers_clone}/scripts/github-repo-lint"
+run_job
+assert_contains 'a changed clone audits' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+fixture="${work_dir}/repo"
+eval "$real_resolver"
+
+printf '\n=== a record dated in the future does not skip ===\n'
+run_job
+runs_before="$(count_runs)"
+read -r recorded_fp _ <"$cache_file"
+printf '%s %s\n' "$recorded_fp" "$(( EPOCHSECONDS + 5000 ))" >"$cache_file"
+run_job
+assert_contains 'a future timestamp audits' "runs=$(( $(count_runs) - runs_before ))" 'runs=1'
+
+printf '\n=== a TTL with a leading zero is read as decimal ===\n'
+run_job
+runs_before="$(count_runs)"
+PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=08 run_job
+assert_contains 'TTL 08 is accepted and skips' "runs=$(( $(count_runs) - runs_before ))" 'runs=0'
+
+test_summary
