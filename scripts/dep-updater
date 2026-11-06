@@ -2147,6 +2147,44 @@ dep_updater_primary_is_generic() {
   runner_primary_is_generic_exit "$1" "dep-updater" "$2"
 }
 
+# dep_updater_rerun_failed_ci <pr_num>
+# Re-queue failed jobs on every failed Actions run for the PR head (one flake
+# retry before closing). Returns 0 when at least one re-run was requested.
+# External status checks with no Actions run cannot be re-queued — returns 1.
+dep_updater_rerun_failed_ci() {
+  local -r pr_num="$1"
+  local run_id exit_code any_ok=0
+  local -a run_ids=()
+
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    run_ids+=("$run_id")
+  done < <(ci_failed_workflow_run_ids_for_pr "$pr_num" "${repo_owner}/${repo_name}" || true)
+  if (( ${#run_ids[@]} == 0 )); then
+    return 1
+  fi
+
+  for run_id in "${run_ids[@]}"; do
+    exit_code=0
+    # Probe: a failed re-queue must not linger as a command failure when another
+    # run on the same head is re-queued successfully (batch report noise). Log
+    # the miss so the all-fail close path still shows why re-queue did not help.
+    dep_runner_gh --probe "gh run rerun failed" -- run rerun --failed "$run_id" \
+      --repo "${repo_owner}/${repo_name}" || exit_code=$?
+    if (( exit_code == 0 )); then
+      any_ok=1
+      log "NOTE: CI_FLAKE_RETRY pr=#${pr_num} run=${run_id} — re-running failed jobs once"
+    else
+      log "NOTE: CI_FLAKE_RETRY_SKIPPED pr=#${pr_num} run=${run_id} exit=${exit_code}"
+    fi
+  done
+  if (( any_ok == 0 )); then
+    log "NOTE: CI_FLAKE_RETRY_FAILED pr=#${pr_num} — every gh run rerun failed; closing on CI failure"
+    return 1
+  fi
+  return 0
+}
+
 # dep_updater_actionable_primary_from_report <report_file> <exit_code>
 # Prefer structured runner failures over generic exit-code placeholders.
 dep_updater_actionable_primary_from_report() {
@@ -8728,6 +8766,17 @@ wait_for_ci() {
   local approval_due=0
   local status raw merge_state already_merged
   local cancelled_diag rollup_diag latest_diag
+  # One automatic re-run of failed Actions jobs absorbs xdist worker crashes and
+  # similar flakes (domesti-bot#935 closed a green pytest 9.2 bump on one crash).
+  # Only Actions runs can be re-queued; a failure with no failed run closes as before.
+  local -r max_ci_flake_retries=1
+  local -r ci_flake_retry_grace_sec=90
+  local ci_flake_retries=0
+  # After requesting a re-run, wait for the rollup to leave failure (pending /
+  # success) before treating another failure as final. Grace is a backstop when
+  # GitHub never flips the rollup (tied to poll_sec, not a magic poll count).
+  local awaiting_rerun_start=0
+  local rerun_grace_remaining_sec=0
 
   if [[ -n "$target_sha" ]]; then
     log "Waiting for CI: pr=#${pr_num} branch='${branch}' head=${target_sha:0:8}"
@@ -8764,16 +8813,42 @@ wait_for_ci() {
         return 0
         ;;
       failure)
-        dep_updater_handle_ci_failure "$pr_num" "$branch"
+        if (( awaiting_rerun_start == 1 )); then
+          if (( rerun_grace_remaining_sec > 0 )); then
+            rerun_grace_remaining_sec=$(( rerun_grace_remaining_sec - poll_sec ))
+            log "Still waiting for CI re-run to start: pr=#${pr_num} branch='${branch}' ${wait_suffix}"
+            approval_due=1
+          else
+            awaiting_rerun_start=0
+            dep_updater_handle_ci_failure "$pr_num" "$branch"
+          fi
+        elif (( ci_flake_retries < max_ci_flake_retries )) \
+          && dep_updater_rerun_failed_ci "$pr_num"; then
+          ci_flake_retries=$(( ci_flake_retries + 1 ))
+          awaiting_rerun_start=1
+          rerun_grace_remaining_sec=$ci_flake_retry_grace_sec
+          # Fresh wait budget for the re-run; the first attempt already used some.
+          elapsed_sec=0
+          approval_due=1
+        else
+          dep_updater_handle_ci_failure "$pr_num" "$branch"
+        fi
         ;;
       missing)
         # GitHub hasn't scheduled CI yet — this is normal right after a push.
         # Keep polling; the 20-minute timeout guards against CI never being scheduled.
+        # Do not clear awaiting_rerun_start here: after a re-run request the rollup
+        # can briefly look empty before pending appears; clearing would let a stale
+        # failure close the PR. Pending (or any running status) clears the grace.
         log "Still waiting for CI scheduling: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         approval_due=1
         ;;
       *)
         # CI is running — log progress and break down per-workflow status.
+        # A pending rollup after a re-run means the flake retry started; a later
+        # failure is then a real second attempt (do not keep swallowing failures).
+        awaiting_rerun_start=0
+        rerun_grace_remaining_sec=0
         log "Still waiting for CI completion: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         approval_due=1
         ;;
@@ -9015,11 +9090,11 @@ require_resume_ci_gate() {
 
   case "$ci_status" in
     failure)
-      # CI has already failed on the interrupted PR — close it automatically
-      # and clean up so the next run starts fresh.
-      cleanup
-      _cleanup_trap_active=0
-      dep_updater_handle_ci_failure "$last_pr" "$last_branch"
+      # Do not cleanup/_cleanup_trap_active=0 here: wait_for_ci may absorb a flake
+      # and return, and a final die still runs cleanup_on_error via the EXIT trap
+      # (same path as a non-resume CI wait).
+      log "Resuming after existing PR #${last_pr} (${last_branch}); CI failed — retrying via wait_for_ci…"
+      wait_for_ci "$last_branch" "$current_head" "$last_pr"
       ;;
     success)
       # CI already passed — nothing to wait for.

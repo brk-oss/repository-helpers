@@ -40,6 +40,8 @@ run_wait() {
     gh_pr_merged_for_number() { printf 'false'; }
     dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
     dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+    # Default: no failed run to re-queue — existing failure cases close immediately.
+    dep_updater_rerun_failed_ci() { return 1; }
     ci_rollup_json_for_pr() { printf '[]'; }
     ci_rollup_latest_by_name_json() { printf '[]'; }
     ci_rollup_without_agent_product_checks() { printf '[]'; }
@@ -95,6 +97,282 @@ out="$(run_wait 'failure' 0)"
 assert_contains "failed CI stops through the failure handler" "$out" "CI failed: pr=#729"
 assert_count_equals "failed CI needs no approval" "$(cat "${work_dir}/approver.log")" "APPROVE" 0
 
+printf '\n=== dep_updater_rerun_failed_ci: observable exit codes and notes ===\n'
+rerun_helper_out="$(timeout 30 bash -c "
+  set -uo pipefail
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  $(awk '/^dep_updater_rerun_failed_ci\(\) \{/,/^\}/' "${dep_updater}")
+  log() { printf '%s\n' \"\$*\"; }
+  : >'${work_dir}/gh-rerun.log'
+  # No failed runs → exit 1
+  ci_failed_workflow_run_ids_for_pr() { return 1; }
+  dep_runner_gh() { printf 'UNEXPECTED\n' >>'${work_dir}/gh-rerun.log'; return 0; }
+  rc=0
+  dep_updater_rerun_failed_ci 11 || rc=\$?
+  echo \"empty_rc=\$rc\"
+  # Two failed runs; second gh call fails → still success if one re-queue worked
+  ci_failed_workflow_run_ids_for_pr() { printf '%s\n' 101 202; }
+  dep_runner_gh() {
+    printf 'PARTIAL %s\n' \"\$*\" >>'${work_dir}/gh-rerun.log'
+    case \"\$*\" in
+      *202*) return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+  rc=0
+  out=\$(dep_updater_rerun_failed_ci 12) || rc=\$?
+  printf '%s\n' \"\$out\"
+  echo \"partial_rc=\$rc\"
+  # Every gh rerun fails → exit 1, no success note
+  dep_runner_gh() {
+    printf 'ALL_FAIL %s\n' \"\$*\" >>'${work_dir}/gh-rerun.log'
+    return 1
+  }
+  rc=0
+  dep_updater_rerun_failed_ci 13 || rc=\$?
+  echo \"all_fail_rc=\$rc\"" 2>&1 || true)"
+assert_contains "no failed run id returns 1" "$rerun_helper_out" "empty_rc=1"
+assert_not_contains "no gh call without run IDs" "$(cat "${work_dir}/gh-rerun.log")" "UNEXPECTED"
+assert_contains "one successful re-queue is enough" "$rerun_helper_out" "partial_rc=0"
+assert_contains "a successful re-queue logs the flake-retry note" "$rerun_helper_out" \
+  "NOTE: CI_FLAKE_RETRY pr=#12 run=101"
+assert_not_contains "a failed gh rerun does not claim success for that run" "$rerun_helper_out" \
+  "NOTE: CI_FLAKE_RETRY pr=#12 run=202"
+assert_contains "a failed gh rerun logs a skipped note" "$rerun_helper_out" \
+  "NOTE: CI_FLAKE_RETRY_SKIPPED pr=#12 run=202"
+assert_contains "partial case attempts run 101" "$(cat "${work_dir}/gh-rerun.log")" \
+  "PARTIAL --probe gh run rerun failed -- run rerun --failed 101 --repo"
+assert_contains "partial case attempts run 202" "$(cat "${work_dir}/gh-rerun.log")" \
+  "PARTIAL --probe gh run rerun failed -- run rerun --failed 202 --repo"
+assert_contains "all gh reruns failing returns 1" "$rerun_helper_out" "all_fail_rc=1"
+assert_contains "all-fail path logs the machine-parseable failure note" "$rerun_helper_out" \
+  "NOTE: CI_FLAKE_RETRY_FAILED pr=#13"
+assert_contains "all-fail case attempts run 101" "$(cat "${work_dir}/gh-rerun.log")" \
+  "ALL_FAIL --probe gh run rerun failed -- run rerun --failed 101 --repo"
+assert_contains "all-fail case attempts run 202" "$(cat "${work_dir}/gh-rerun.log")" \
+  "ALL_FAIL --probe gh run rerun failed -- run rerun --failed 202 --repo"
+
+printf '\n=== a first CI failure re-runs failed jobs once before closing ===\n'
+# Override the default no-op re-run stub: first failure re-queues, then pending → success.
+out="$(timeout 60 bash -c "
+  set -uo pipefail
+  dep_script_dir='/dep/scripts'
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  ci_required_contexts=''
+  $(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")
+  $(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")
+  log() { printf '%s\n' \"\$*\"; }
+  die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+  sleep() { :; }
+  gh_pr_merged_for_number() { printf 'false'; }
+  dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
+  dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+  ci_rollup_json_for_pr() { printf '[]'; }
+  ci_rollup_latest_by_name_json() { printf '[]'; }
+  ci_rollup_without_agent_product_checks() { printf '[]'; }
+  ci_rollup_cancelled_names_csv() { printf ''; }
+  runner_exec() { return 0; }
+  : >'${work_dir}/rerun.log'
+  dep_updater_rerun_failed_ci() {
+    printf 'RERUN %s\n' \"\$1\" >>'${work_dir}/rerun.log'
+    log \"NOTE: CI_FLAKE_RETRY pr=#\$1 run=999 — re-running failed jobs once\"
+    return 0
+  }
+  printf 0 >'${work_dir}/polls.n'
+  # failure → (rerun) → failure (ignored) → pending → success
+  read -r -a statuses <<<'failure failure pending success'
+  ci_conclusion_for_pr() {
+    local idx
+    idx=\$(cat '${work_dir}/polls.n')
+    printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/polls.n'
+    (( idx < \${#statuses[@]} )) || idx=\$(( \${#statuses[@]} - 1 ))
+    printf '%s' \"\${statuses[idx]}\"
+  }
+  rc=0
+  wait_for_ci dep-updates/batch-1 deadbeefcafe 729 || rc=\$?
+  echo \"rc=\$rc\"" 2>&1 || true)"
+assert_contains "the wait recovers after a flake re-run" "$out" "rc=0"
+assert_contains "the re-run is announced with a machine-parseable note" "$out" \
+  "NOTE: CI_FLAKE_RETRY pr=#729"
+assert_contains "CI is reported green after the re-run" "$out" "CI passed: pr=#729"
+assert_count_equals "failed jobs are re-queued exactly once" \
+  "$(cat "${work_dir}/rerun.log")" "RERUN" 1
+assert_not_contains "the PR is not closed on the first failure" "$out" "CI failed: pr=#729"
+
+printf '\n=== a failure after pending (post-rerun) closes without a second re-run ===\n'
+out="$(timeout 60 bash -c "
+  set -uo pipefail
+  dep_script_dir='/dep/scripts'
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  ci_required_contexts=''
+  $(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")
+  $(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")
+  log() { printf '%s\n' \"\$*\"; }
+  die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+  sleep() { :; }
+  gh_pr_merged_for_number() { printf 'false'; }
+  dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
+  dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+  ci_rollup_json_for_pr() { printf '[]'; }
+  ci_rollup_latest_by_name_json() { printf '[]'; }
+  ci_rollup_without_agent_product_checks() { printf '[]'; }
+  ci_rollup_cancelled_names_csv() { printf ''; }
+  runner_exec() { return 0; }
+  : >'${work_dir}/rerun.log'
+  dep_updater_rerun_failed_ci() {
+    printf 'RERUN %s\n' \"\$1\" >>'${work_dir}/rerun.log'
+    return 0
+  }
+  printf 0 >'${work_dir}/polls.n'
+  # Rerun starts (pending clears grace); second failure closes without another rerun.
+  read -r -a statuses <<<'failure pending failure success'
+  ci_conclusion_for_pr() {
+    local idx
+    idx=\$(cat '${work_dir}/polls.n')
+    printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/polls.n'
+    (( idx < \${#statuses[@]} )) || idx=\$(( \${#statuses[@]} - 1 ))
+    printf '%s' \"\${statuses[idx]}\"
+  }
+  rc=0
+  wait_for_ci dep-updates/batch-1 deadbeefcafe 729 || rc=\$?
+  echo \"rc=\$rc\"" 2>&1 || true)"
+assert_contains "pending clears grace so the next failure closes" "$out" "CI failed: pr=#729"
+assert_not_contains "success after that close is never reported" "$out" "CI passed: pr=#729"
+assert_count_equals "only the first failure triggers a re-run" \
+  "$(cat "${work_dir}/rerun.log")" "RERUN" 1
+
+printf '\n=== a second CI failure after the flake re-run still closes the PR ===\n'
+out="$(timeout 60 bash -c "
+  set -uo pipefail
+  dep_script_dir='/dep/scripts'
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  ci_required_contexts=''
+  $(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")
+  $(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")
+  log() { printf '%s\n' \"\$*\"; }
+  die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+  sleep() { :; }
+  gh_pr_merged_for_number() { printf 'false'; }
+  dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
+  dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+  ci_rollup_json_for_pr() { printf '[]'; }
+  ci_rollup_latest_by_name_json() { printf '[]'; }
+  ci_rollup_without_agent_product_checks() { printf '[]'; }
+  ci_rollup_cancelled_names_csv() { printf ''; }
+  runner_exec() { return 0; }
+  : >'${work_dir}/rerun.log'
+  dep_updater_rerun_failed_ci() {
+    printf 'RERUN %s\n' \"\$1\" >>'${work_dir}/rerun.log'
+    return 0
+  }
+  printf 0 >'${work_dir}/polls.n'
+  # First failure triggers re-run; remaining polls stay failed past the ignore window.
+  read -r -a statuses <<<'failure failure failure failure failure failure failure failure'
+  ci_conclusion_for_pr() {
+    local idx
+    idx=\$(cat '${work_dir}/polls.n')
+    printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/polls.n'
+    (( idx < \${#statuses[@]} )) || idx=\$(( \${#statuses[@]} - 1 ))
+    printf '%s' \"\${statuses[idx]}\"
+  }
+  rc=0
+  wait_for_ci dep-updates/batch-1 deadbeefcafe 729 || rc=\$?
+  echo \"rc=\$rc\"" 2>&1 || true)"
+assert_contains "a persistent failure still closes after one re-run" "$out" "CI failed: pr=#729"
+assert_count_equals "failed jobs are still re-queued only once" \
+  "$(cat "${work_dir}/rerun.log")" "RERUN" 1
+
+printf '\n=== missing after a flake re-run keeps grace (does not close on next failure) ===\n'
+out="$(timeout 60 bash -c "
+  set -uo pipefail
+  dep_script_dir='/dep/scripts'
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  ci_required_contexts=''
+  $(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")
+  $(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")
+  log() { printf '%s\n' \"\$*\"; }
+  die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+  sleep() { :; }
+  gh_pr_merged_for_number() { printf 'false'; }
+  dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
+  dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+  ci_rollup_json_for_pr() { printf '[]'; }
+  ci_rollup_latest_by_name_json() { printf '[]'; }
+  ci_rollup_without_agent_product_checks() { printf '[]'; }
+  ci_rollup_cancelled_names_csv() { printf ''; }
+  runner_exec() { return 0; }
+  : >'${work_dir}/rerun.log'
+  dep_updater_rerun_failed_ci() {
+    printf 'RERUN %s\n' \"\$1\" >>'${work_dir}/rerun.log'
+    log \"NOTE: CI_FLAKE_RETRY pr=#\$1 run=999 — re-running failed jobs once\"
+    return 0
+  }
+  printf 0 >'${work_dir}/polls.n'
+  # failure → rerun → missing (must keep grace) → failure (still grace) → pending → success
+  read -r -a statuses <<<'failure missing failure pending success'
+  ci_conclusion_for_pr() {
+    local idx
+    idx=\$(cat '${work_dir}/polls.n')
+    printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/polls.n'
+    (( idx < \${#statuses[@]} )) || idx=\$(( \${#statuses[@]} - 1 ))
+    printf '%s' \"\${statuses[idx]}\"
+  }
+  rc=0
+  wait_for_ci dep-updates/batch-1 deadbeefcafe 729 || rc=\$?
+  echo \"rc=\$rc\"" 2>&1 || true)"
+assert_contains "missing during grace still recovers" "$out" "rc=0"
+assert_contains "CI is green after missing-then-failure within grace" "$out" "CI passed: pr=#729"
+assert_not_contains "the PR is not closed while grace covers a stale failure" "$out" "CI failed: pr=#729"
+assert_count_equals "failed jobs are re-queued exactly once across the missing gap" \
+  "$(cat "${work_dir}/rerun.log")" "RERUN" 1
+
+printf '\n=== resume failure path routes through wait_for_ci (flake retry) ===\n'
+resume_out="$(timeout 60 bash -c "
+  set -uo pipefail
+  no_wait_ci=0
+  worktree_path='${work_dir}/wt'
+  mkdir -p \"\$worktree_path\"
+  repo_owner='the-hcma'
+  repo_name='repository-helpers'
+  $(awk '/^require_resume_ci_gate\(\) \{/,/^\}/' "${dep_updater}")
+  csv_last() { printf '%s' \"\${1##*,}\"; }
+  is_valid_pr_number() { [[ \"\$1\" =~ ^[0-9]+\$ ]]; }
+  is_interactive() { return 1; }
+  gh_pr_number_for_branch() { printf '42'; }
+  gh_pr_state_for_number() { printf 'open'; }
+  gh_pr_merged_for_number() { printf 'false'; }
+  dep_runner_git_c_stdout() { printf 'deadbeefcafe'; }
+  ci_run_exists_for_head() { return 0; }
+  ci_conclusion_for_pr() { printf 'failure'; }
+  : >'${work_dir}/resume-wait.log'
+  wait_for_ci() {
+    printf 'WAIT %s %s %s\n' \"\$1\" \"\$2\" \"\$3\" >>'${work_dir}/resume-wait.log'
+    log \"wait_for_ci called for pr=#\$3\"
+  }
+  log() { printf '%s\n' \"\$*\"; }
+  die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+  git() {
+    # pretend the resume branch exists locally
+    case \"\$*\" in
+      *'show-ref --verify'*'refs/heads/'*) return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  rc=0
+  require_resume_ci_gate 'dep-updates/batch-1' '42' || rc=\$?
+  echo \"rc=\$rc\"" 2>&1 || true)"
+assert_contains "resume on failure calls wait_for_ci" "$(cat "${work_dir}/resume-wait.log")" \
+  "WAIT dep-updates/batch-1 deadbeefcafe 42"
+assert_contains "resume announces the flake-retry path" "$resume_out" \
+  "CI failed — retrying via wait_for_ci"
+assert_contains "resume returns after a successful wait_for_ci" "$resume_out" "rc=0"
+assert_not_contains "resume does not close before wait_for_ci" "$resume_out" "CI failed: pr=#42"
+
 printf '\n=== a failed approval stops the run with a parseable line ===\n'
 out="$(run_wait 'pending success' 1)"
 assert_contains "the run reports ENVIRONMENT_APPROVAL_FAILED for the PR and repository" "$out" \
@@ -116,6 +394,8 @@ printf '\n=== static: the approval is part of the CI wait ===\n'
 wait_body="$(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")"
 assert_contains "wait_for_ci calls the approval helper" "$wait_body" \
   "dep_updater_approve_waiting_environments \"\$pr_num\""
+assert_contains "wait_for_ci tries one flake re-run before closing" "$wait_body" \
+  "dep_updater_rerun_failed_ci \"\$pr_num\""
 helper_body="$(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")"
 assert_contains "the helper passes the repository to the approver" "$helper_body" \
   "--repo \"\${repo_owner}/\${repo_name}\""
