@@ -1,0 +1,256 @@
+# shellcheck shell=bash
+# tmp-layout — per-run temp layout $TMPDIR/<project>/<branch>/<tool> (#832).
+#
+# Every test framework and package manager keeps its temp files under one predictable directory:
+#
+#   $TMPDIR/<project>/<branch>/<tool>        e.g. /tmp/domesti-bot/feat/foo/pytest
+#
+# <branch> is the current branch; on a detached HEAD it is detached-head/<short-sha>.
+# A test tool's runs each get their own marked subdirectory (tmp_layout_run_dir), so concurrent runs on one branch
+# never touch each other. tmp_layout_finish removes a run's directory after a passing run and keeps it
+# after a failing one. A package-manager cache uses the tool directory itself and is never finished.
+# Every run directory (and every package-manager cache, via tmp_layout_mark) carries a marker file, and
+# tmp_layout_prepare first removes any marked
+# directory of the project older than TMP_LAYOUT_RETENTION_DAYS (default 3), so a failed run's leftovers
+# cannot pile up. Only marked directories are ever removed, never anything else under $TMPDIR.
+#
+# Sourced by scripts/dev/run-tests and scripts/dev/with-tmp-layout, which begin a runner session first.
+
+if declare -F tmp_layout_prepare >/dev/null 2>&1; then
+  return 0
+fi
+
+_tmp_layout_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _tmp_layout_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_tmp_layout_lib_dir}/runner-ensure"
+
+readonly tmp_layout_marker='.tmp-layout-marker'
+readonly tmp_layout_default_retention_days=3
+
+# tmp_layout_git <dir> <args…> — git -C <dir> through the runner; prints stdout, fails quietly on error.
+tmp_layout_git() {
+  local -r dir="$1"
+  shift
+  runner_exec_stdout "tmp-layout git $*" --probe -- git -C "$dir" "$@"
+}
+
+# tmp_layout_tmpdir — $TMPDIR (default /tmp) without trailing slashes.
+# TMP_LAYOUT_TMPDIR overrides it for callers (pre-pr-checks) that point TMPDIR at a disposable directory but
+# want a failed run's kept artifacts to outlive them.
+tmp_layout_tmpdir() {
+  local base="${TMP_LAYOUT_TMPDIR:-${TMPDIR:-/tmp}}"
+  while [[ "$base" == */ && "$base" != / ]]; do
+    base="${base%/}"
+  done
+  printf '%s\n' "$base"
+}
+
+# tmp_layout_component_ok <name> — one safe path component: non-empty, not "." / "..", no slash.
+tmp_layout_component_ok() {
+  local -r name="$1"
+  [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]]
+}
+
+# tmp_layout_path_ok <relative-path> — slash-separated safe components only (not absolute).
+tmp_layout_path_ok() {
+  local -r rel="$1"
+  local part
+  local -a parts=()
+
+  [[ -n "$rel" && "$rel" != /* ]] || return 1
+  IFS=/ read -r -a parts <<<"$rel"
+  for part in "${parts[@]}"; do
+    tmp_layout_component_ok "$part" || return 1
+  done
+}
+
+# tmp_layout_in_git [dir] — true inside a git work tree (the layout then applies, and its errors are real).
+tmp_layout_in_git() {
+  [[ "$(tmp_layout_git "${1:-.}" rev-parse --is-inside-work-tree || true)" == true ]]
+}
+
+# tmp_layout_project [dir] — project name: the origin repository name, else the primary clone's directory
+# name (a worktree shares its primary clone's name). Fails when neither can be determined.
+tmp_layout_project() {
+  local -r dir="${1:-.}"
+  local url name common
+
+  url="$(tmp_layout_git "$dir" remote get-url origin || true)"
+  if [[ -n "$url" ]]; then
+    url="${url%"${url##*[!/]}"}"
+    name="${url##*/}"
+    name="${name%.git}"
+    name="${name##*:}"
+  else
+    common="$(tmp_layout_git "$dir" rev-parse --path-format=absolute --git-common-dir || true)"
+    [[ -n "$common" ]] || return 1
+    name="$(basename "$(dirname "$common")")"
+  fi
+  tmp_layout_component_ok "$name" || return 1
+  printf '%s\n' "$name"
+}
+
+# tmp_layout_branch [dir] — current branch, or detached-head/<short-sha> on a detached HEAD.
+tmp_layout_branch() {
+  local -r dir="${1:-.}"
+  local branch sha
+
+  branch="$(tmp_layout_git "$dir" symbolic-ref --short --quiet HEAD || true)"
+  if [[ -z "$branch" ]]; then
+    sha="$(tmp_layout_git "$dir" rev-parse --short HEAD)" || return 1
+    branch="detached-head/${sha}"
+  fi
+  tmp_layout_path_ok "$branch" || return 1
+  printf '%s\n' "$branch"
+}
+
+# tmp_layout_retention_days — TMP_LAYOUT_RETENTION_DAYS or 3; anything but a positive integer is an error.
+tmp_layout_retention_days() {
+  local -r value="${TMP_LAYOUT_RETENTION_DAYS:-$tmp_layout_default_retention_days}"
+  if [[ ! "$value" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    printf 'ERROR: TMP_LAYOUT_RETENTION_DAYS must be a positive integer (got %s)\n' "$value" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# tmp_layout_project_root <dir> — $TMPDIR/<project>.
+tmp_layout_project_root() {
+  local project base
+  project="$(tmp_layout_project "${1:-.}")" || return 1
+  base="$(tmp_layout_tmpdir)"
+  printf '%s/%s\n' "$base" "$project"
+}
+
+# tmp_layout_dir <tool> [dir] — $TMPDIR/<project>/<branch>/<tool>; nothing is created.
+tmp_layout_dir() {
+  local -r tool="$1" dir="${2:-.}"
+  local root branch
+  tmp_layout_component_ok "$tool" || { printf 'ERROR: invalid tool name: %s\n' "$tool" >&2; return 1; }
+  root="$(tmp_layout_project_root "$dir")" \
+    || { printf 'ERROR: cannot determine the project for %s\n' "$dir" >&2; return 1; }
+  branch="$(tmp_layout_branch "$dir")" \
+    || { printf 'ERROR: cannot determine a safe branch for %s\n' "$dir" >&2; return 1; }
+  printf '%s/%s/%s\n' "$root" "$branch" "$tool"
+}
+
+# tmp_layout_prune_empty <dir> <stop-at> — rmdir empty directories from <dir> up to, not including, <stop-at>.
+tmp_layout_prune_empty() {
+  local current="$1"
+  local -r stop="$2"
+  while [[ "$current" == "$stop"/* ]]; do
+    rmdir "$current" 2>/dev/null || return 0
+    current="$(dirname "$current")"
+  done
+}
+
+# tmp_layout_sweep_stale [dir] — remove this project's marked directories older than the retention.
+tmp_layout_sweep_stale() {
+  local -r dir="${1:-.}"
+  local root days marker stale
+  root="$(tmp_layout_project_root "$dir")" || return 1
+  days="$(tmp_layout_retention_days)" || return 1
+  [[ -d "$root" ]] || return 0
+  while IFS= read -r -d '' marker; do
+    stale="$(dirname "$marker")"
+    printf 'tmp-layout: removing stale %s (older than %s days)\n' "$stale" "$days" >&2
+    rm -rf -- "$stale"
+    tmp_layout_prune_empty "$(dirname "$stale")" "$root"
+  done < <(find "$root" -type f -name "$tmp_layout_marker" -mtime "+$((days - 1))" -print0 2>/dev/null)
+}
+
+# tmp_layout_prepare <tool> [dir] — sweep stale directories, create the tool directory, print it.
+tmp_layout_prepare() {
+  local -r tool="$1" dir="${2:-.}"
+  local target root
+  target="$(tmp_layout_dir "$tool" "$dir")" || return 1
+  root="$(tmp_layout_project_root "$dir")" || return 1
+  tmp_layout_secure_root "$root" || return 1
+  tmp_layout_sweep_stale "$dir" || return 1
+  mkdir -p -- "$target"
+  printf '%s\n' "$target"
+}
+
+# tmp_layout_secure_root <project-root> — create the project directory private (0700) and refuse one that
+# is a symlink or belongs to someone else, which on a shared /tmp would let another user redirect our
+# marker and cache writes. A directory we own that is group/world-writable (made under umask 002, say) is
+# repaired with chmod go-w when everything inside it is ours too, and refused otherwise.
+tmp_layout_secure_root() {
+  local -r root="$1"
+  if [[ ! -e "$root" && ! -L "$root" ]]; then
+    # Two runs starting together may both try: only report a failure when the directory is still missing.
+    mkdir -m 700 -- "$root" 2>/dev/null || [[ -d "$root" ]] || mkdir -m 700 -- "$root" || true
+  fi
+  if [[ -d "$root" && ! -L "$root" && -O "$root" ]] \
+    && [[ -n "$(find "$root" -maxdepth 0 -perm /022 2>/dev/null)" ]] \
+    && [[ -z "$(find "$root" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
+    chmod go-w -- "$root"
+  fi
+  if [[ -L "$root" || ! -d "$root" || ! -O "$root" ]] \
+    || [[ -n "$(find "$root" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then
+    printf 'ERROR: %s must be a directory you own, private (not group/world-writable) and not a symlink\n' \
+      "$root" >&2
+    return 1
+  fi
+}
+
+# tmp_layout_mark <dir> — (re)stamp a directory so the stale sweep may remove it once it goes unused for the
+# retention. A package-manager cache is stamped on every use, so it expires only after it sits idle.
+# A marker that is a symlink is refused rather than written through.
+tmp_layout_mark() {
+  local -r marker="${1}/${tmp_layout_marker}"
+  if [[ -L "$marker" ]]; then
+    printf 'ERROR: %s is a symlink; refusing to write through it\n' "$marker" >&2
+    return 1
+  fi
+  : >"$marker"
+}
+
+# tmp_layout_run_dir <tool-dir> — a fresh, marked directory for one run inside a tool directory. The marker
+# is written once, so a failed run's leftovers age from that run and are swept however busy the branch is.
+# A concurrent run may remove an empty tool directory between the mkdir and the mktemp, so retry.
+tmp_layout_run_dir() {
+  local -r target="$1"
+  local run
+
+  for _ in 1 2 3 4 5; do
+    mkdir -p -- "$target"
+    if run="$(mktemp -d "${target}/run.XXXXXX" 2>/dev/null)"; then
+      # An unmarked directory could never be swept, so a run that cannot be marked is not handed out.
+      if ! tmp_layout_mark "$run"; then
+        rm -rf -- "$run"
+        return 1
+      fi
+      printf '%s\n' "$run"
+      return 0
+    fi
+  done
+  printf 'ERROR: cannot create a run directory under %s\n' "$target" >&2
+  return 1
+}
+
+# tmp_layout_finish <run-dir> <exit-code> — remove the run directory after a passing run (exit 0), then the
+# tool directory and empty parents when no other run is using them (rmdir only ever removes an empty
+# directory); keep it, and say where, after a failing one. Never fails because of cleanup: the caller's
+# exit status is the run's.
+tmp_layout_finish() {
+  local -r run="$1" rc="$2"
+  local base rel
+
+  if [[ "$rc" != 0 ]]; then
+    printf 'tmp-layout: run failed (exit %s); keeping %s for debugging\n' "$rc" "$run" >&2
+    return 0
+  fi
+  rm -rf -- "$run"
+  # Prune empty branch and tool directories, but never the private project directory itself: a concurrent
+  # caller validated it, and recreating it here would drop its mode and ownership checks.
+  base="$(tmp_layout_tmpdir)"
+  rel="${run#"$base"/}"
+  # A run outside the current temp root (TMP_LAYOUT_TMPDIR or TMPDIR changed since it was allocated) has no
+  # project directory to stop at: its own directory is removed above, but its parents are left alone rather
+  # than pruned past a wrong boundary (empty branch and tool directories stay until the stale sweep).
+  [[ "$rel" != "$run" && "$rel" == */* ]] || return 0
+  tmp_layout_prune_empty "$(dirname "$run")" "${base}/${rel%%/*}"
+  return 0
+}
