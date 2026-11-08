@@ -320,4 +320,52 @@ assert_contains 'the Cursor shim links a canonical rule target' "$shim_target" '
 assert_contains 'the Cursor shim link target resolves to the agents rule file' \
   "$([[ -f "$(dirname "$shim_file")/${shim_target}" ]] && echo present || echo missing)" 'present'
 
+printf '\n=== functional: TERM reaches the wrapped command and the run is kept (repository-helpers#837) ===\n'
+sig_pidfile="${fixture}/sig-child.pid"
+rm -f -- "$sig_pidfile"
+# shellcheck disable=SC2016  # the variables must expand in the child, not here
+( cd "$repo" && exec "$wrapper" pytest -- bash -c 'printf "%s" "$$" >"$1"; exec sleep 60' _ "$sig_pidfile" ) >/dev/null 2>&1 &
+sig_wrapper=$!
+# Wait (bounded) until the child has started and written its pid.
+for _ in $(seq 1 200); do
+  [[ -s "$sig_pidfile" ]] && break
+  /bin/sleep 0.05
+done
+sig_child="$(cat "$sig_pidfile" 2>/dev/null || true)"
+assert_contains 'the wrapped command started and recorded its pid' "$([[ -n "$sig_child" ]] && echo yes || echo no)" 'yes'
+kill -s TERM "$sig_wrapper"
+sig_rc=0
+wait "$sig_wrapper" || sig_rc=$?
+assert_contains 'a TERM sent only to the wrapper ends it with the command status 143' "rc=${sig_rc}" 'rc=143'
+sig_alive=no
+if [[ -n "$sig_child" ]] && kill -0 "$sig_child" 2>/dev/null; then
+  sig_alive=yes
+  kill -s KILL "$sig_child" 2>/dev/null || true
+fi
+assert_contains 'the wrapped command is gone after the wrapper is terminated' "alive=${sig_alive}" 'alive=no'
+sig_kept="$(find "${TMPDIR}/widget/feat/foo/pytest" -maxdepth 1 -name 'run.*' 2>/dev/null | head -n 1)"
+assert_contains 'the run directory is kept after a terminated run' "$([[ -d "$sig_kept" ]] && echo yes || echo no)" 'yes'
+assert_contains 'the wrapper installs the TERM and INT forwarding trap before it starts the command' \
+  "$(awk '/^  trap on_signal TERM INT$/ {t = NR} /^  "\$@" <&0 &$/ {c = NR} END {print (t > 0 && c > t) ? "before" : "after"}' "$wrapper")" 'before'
+
+# A command that handles the TERM and exits 0 makes the whole run a success: exit 0 and the run directory removed.
+sig_pidfile2="${fixture}/sig-child2.pid"
+rm -f -- "$sig_pidfile2"
+rm -rf -- "${TMPDIR}/widget/feat/foo/pytest"
+# shellcheck disable=SC2016  # the variables must expand in the child, not here
+( cd "$repo" && exec "$wrapper" pytest -- bash -c 'trap "exit 0" TERM; printf "%s" "$$" >"$1"; while :; do /bin/sleep 0.05; done' _ "$sig_pidfile2" ) >/dev/null 2>&1 &
+sig_wrapper2=$!
+for _ in $(seq 1 200); do
+  [[ -s "$sig_pidfile2" ]] && break
+  /bin/sleep 0.05
+done
+kill -s TERM "$sig_wrapper2"
+sig_rc2=0
+wait "$sig_wrapper2" || sig_rc2=$?
+assert_contains 'a command that exits 0 after the forwarded TERM gives the wrapper exit status 0' "rc=${sig_rc2}" 'rc=0'
+sig_left="$(find "${TMPDIR}/widget/feat/foo/pytest" -maxdepth 1 -name 'run.*' 2>/dev/null | head -n 1 || true)"
+assert_contains 'the run directory is removed after that clean exit' "left=${sig_left:-none}" 'left=none'
+echo piped-input | { cd "$repo" && "$wrapper" pytest -- cat >"${fixture}/stdin-out"; }
+assert_contains 'the wrapped command still reads the caller stdin' "$(cat "${fixture}/stdin-out")" 'piped-input'
+
 test_summary
