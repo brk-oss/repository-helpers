@@ -15,7 +15,8 @@
 #     | grep -E 'linux_(amd64|arm64)\.tar\.gz'
 #
 # Environment:
-#   ACTIONLINT_BIN_DIR            Install directory (default: /usr/local/bin, installed with sudo)
+#   ACTIONLINT_BIN_DIR            Install directory (default: /usr/local/bin, installed with sudo -n,
+#                                 or directly when root; never waits for a password)
 #   ACTIONLINT_DOWNLOAD_RETRIES   Attempts (default 5)
 #   ACTIONLINT_RETRY_DELAY        Seconds per attempt step, linear backoff (default 30 => 300s in total)
 
@@ -55,7 +56,7 @@ actionlint_install_binary() {
     # A root container may have no sudo at all: install directly.
     install -m 0755 "$src" "${dest}/actionlint"
   else
-    sudo install -m 0755 "$src" "${dest}/actionlint"
+    sudo -n install -m 0755 "$src" "${dest}/actionlint"
   fi
 }
 
@@ -108,8 +109,9 @@ main() {
     case "$http_code" in
       400 | 401 | 404 | 410) break ;;
     esac
-    # A certificate-verification failure (curl exit 60) repeats on every attempt: report it now.
-    if [[ "$curl_rc" -eq 60 ]]; then
+    # Neither a certificate-verification failure (curl exit 60) nor a write error (exit 23, a full disk)
+    # heals between attempts: report it now.
+    if [[ "$curl_rc" -eq 60 || "$curl_rc" -eq 23 ]]; then
       break
     fi
     if [[ "$http_code" == '200' ]]; then
