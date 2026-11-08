@@ -8292,6 +8292,16 @@ rp_tmp_layout_strip_comments() {
 rp_tmp_layout_text_needs_layout() {
   local text tool_pattern
   text="$(rp_tmp_layout_strip_comments "$1")"
+  # The arguments a .github/ci wrapper receives (`bash .github/ci/pnpm-run pnpm install`) go to that wrapper, which is
+  # checked on its own, so cut the wrapper path and its arguments up to the next separator; a command chained after it
+  # (`bash .github/ci/x && uv sync`) stays. A command substitution after the path is not followed (rare shape).
+  text="$(sed -E 's#\.github/ci/[^&|;]*##g' <<<"$text")"
+  # A wrapper that runs its own arguments as the command (`exec "$@"`, `command "$@"`, `exec -- "${@}"`) runs a tool
+  # too; `exec with-tmp-layout ... "$@"` names the helper first, so it does not match.
+  local -r forward='(^|[;&|])[[:space:]]*((then|else|do)[[:space:]]+)?(exec[[:space:]]+(--[[:space:]]+)?|command[[:space:]]+(--[[:space:]]+)?)?"\$(@|\{@\})"'
+  if grep -Eq "$forward" <<<"$(rp_tmp_layout_strip_comments "$1")"; then
+    return 0
+  fi
   # pytest only counts in command position (`pytest ...`, `uv run pytest`, `python -m pytest`), so `pip install
   # pytest-cov` or `echo pytest` does not make a workflow need the layout. A quoted YAML value (`run: 'uv sync'`)
   # and global options before the subcommand (`uv --project app sync`) still count.
