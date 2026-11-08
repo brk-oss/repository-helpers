@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# ci-actionlint — install a pinned actionlint release, retrying through a github.com blip.
+#
+# Run by the setup-actionlint composite action (actions/setup-actionlint). It replaces the unpinned, unretried
+# `curl -sSL .../actionlint/main/scripts/download-actionlint.bash | bash` pattern, which turned a
+# transient github.com release outage into a failed Workflow Lint check (repository-helpers#842).
+#
+# Supply chain: the version is pinned (never `latest`, never a branch-tip script), the download is
+# HTTPS from github.com release assets, the archive is checked as a gzip, and its SHA-256 is compared
+# with the digest recorded below (from the release's actionlint_<ver>_checksums.txt) before it is
+# extracted, so a swapped asset or an HTML/JSON error body fails loudly instead of reaching `tar`.
+#
+# Bump actionlint_version AND actionlint_sha256 together. Regenerate the digests with:
+#   curl -fsSL https://github.com/rhysd/actionlint/releases/download/v<VER>/actionlint_<VER>_checksums.txt \
+#     | grep -E 'linux_(amd64|arm64)\.tar\.gz'
+#
+# Environment:
+#   ACTIONLINT_BIN_DIR            Install directory (default: /usr/local/bin, installed with sudo)
+#   ACTIONLINT_DOWNLOAD_RETRIES   Attempts (default 5)
+#   ACTIONLINT_RETRY_DELAY        Seconds per attempt step, linear backoff (default 30 => 300s in total)
+
+set -euo pipefail
+
+actionlint_version='1.7.12'
+readonly actionlint_version
+
+declare -rA actionlint_sha256=(
+  [linux_amd64]='8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+  [linux_arm64]='325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6'
+)
+
+actionlint_retries="${ACTIONLINT_DOWNLOAD_RETRIES:-5}"
+actionlint_retry_delay="${ACTIONLINT_RETRY_DELAY:-30}"
+if [[ ! "$actionlint_retries" =~ ^[1-9][0-9]{0,2}$ ]] || [[ ! "$actionlint_retry_delay" =~ ^[0-9]{1,4}$ ]]; then
+  printf 'ERROR: invalid ACTIONLINT_DOWNLOAD_RETRIES or ACTIONLINT_RETRY_DELAY\n' >&2
+  exit 2
+fi
+readonly actionlint_retries actionlint_retry_delay
+
+# Overall download budget in seconds. Each transfer is capped at actionlint_transfer_max_time with no
+# curl-level retry (the loop below is the only retry layer), and no new attempt starts unless its backoff
+# plus a full transfer still fits in this budget, so a stalled release server cannot outlast a 10-minute
+# CI job: the worst case is the budget itself.
+actionlint_deadline=480
+actionlint_transfer_max_time=60
+readonly actionlint_deadline actionlint_transfer_max_time
+
+# actionlint_install_binary SRC DEST_DIR — install SRC as DEST_DIR/actionlint (mode 0755).
+actionlint_install_binary() {
+  local -r src="$1"
+  local -r dest="$2"
+  if [[ "$dest" != '/usr/local/bin' ]]; then
+    mkdir -p "$dest" && install -m 0755 "$src" "${dest}/actionlint"
+  elif [[ "$(id -u)" -eq 0 ]]; then
+    # A root container may have no sudo at all: install directly.
+    install -m 0755 "$src" "${dest}/actionlint"
+  else
+    sudo install -m 0755 "$src" "${dest}/actionlint"
+  fi
+}
+
+actionlint_sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+main() {
+  local arch platform url tmpdir archive dest_dir attempt http_code curl_rc want got
+  local last_http_code last_curl_rc last_err attempts_word body_problem next_sleep projected
+
+  case "$(uname -m)" in
+    x86_64 | amd64) arch='amd64' ;;
+    aarch64 | arm64) arch='arm64' ;;
+    *)
+      printf 'ERROR: unsupported architecture for actionlint: %s\n' "$(uname -m)" >&2
+      return 1
+      ;;
+  esac
+  if [[ "$(uname -s)" != 'Linux' ]]; then
+    printf 'ERROR: setup-actionlint supports Linux runners only\n' >&2
+    return 1
+  fi
+  platform="linux_${arch}"
+  want="${actionlint_sha256[$platform]}"
+  url="https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}"
+  url+="/actionlint_${actionlint_version}_${platform}.tar.gz"
+  tmpdir="$(mktemp -d)"
+  archive="${tmpdir}/actionlint.tar.gz"
+  dest_dir="${ACTIONLINT_BIN_DIR:-/usr/local/bin}"
+  last_http_code='000'
+  last_curl_rc=0
+  body_problem=''
+  SECONDS=0
+
+  for attempt in $(seq 1 "$actionlint_retries"); do
+    curl_rc=0
+    http_code="$(curl --fail --silent --show-error --location \
+      --connect-timeout 20 --max-time "$actionlint_transfer_max_time" \
+      -o "$archive" -w '%{http_code}' "$url" \
+      2>"${tmpdir}/curl.err")" || curl_rc=$?
+    last_http_code="${http_code:-000}"
+    last_curl_rc="$curl_rc"
+    body_problem=''
+    # A permanent client error (bad version or URL) will not heal: fail now instead of after the full window.
+    case "$http_code" in
+      400 | 401 | 404 | 410) break ;;
+    esac
+    # A certificate-verification failure (curl exit 60) repeats on every attempt: report it now.
+    if [[ "$curl_rc" -eq 60 ]]; then
+      break
+    fi
+    if [[ "$http_code" == '200' ]]; then
+      if [[ ! -s "$archive" ]]; then
+        body_problem='empty body'
+      elif ! gzip --test "$archive" 2>/dev/null; then
+        body_problem='body is not a valid gzip archive'
+      fi
+    fi
+    if [[ "$http_code" == '200' && "$curl_rc" -eq 0 && -z "$body_problem" ]]; then
+      # No checksum tool (or an unreadable archive) is not transient either: clean up and say so.
+      if ! got="$(actionlint_sha256_of "$archive")" || [[ -z "$got" ]]; then
+        rm -rf "$tmpdir"
+        printf 'ERROR: actionlint checksum could not be computed (need sha256sum or shasum)\n' >&2
+        return 1
+      fi
+      # A digest mismatch is not transient: fail at once, do not retry.
+      if [[ "$got" != "$want" ]]; then
+        rm -rf "$tmpdir"
+        printf 'ERROR: actionlint checksum mismatch (%s v%s)\n  expected %s\n  got      %s\n' \
+          "$platform" "$actionlint_version" "$want" "$got" >&2
+        return 1
+      fi
+      # Extraction or install can still fail (no sudo, unwritable directory): clean up and say so.
+      if ! tar --extract --gzip --file "$archive" --directory "$tmpdir" actionlint \
+        || ! actionlint_install_binary "${tmpdir}/actionlint" "$dest_dir"; then
+        rm -rf "$tmpdir"
+        printf 'ERROR: actionlint install failed (extract or copy into %s)\n' "$dest_dir" >&2
+        return 1
+      fi
+      rm -rf "$tmpdir"
+      printf 'Installed actionlint v%s (%s) to %s\n' "$actionlint_version" "$platform" "$dest_dir"
+      return 0
+    fi
+    rm -f "$archive"
+    if (( attempt < actionlint_retries )); then
+      next_sleep=$(( attempt * 10#${actionlint_retry_delay} ))
+      # Out of overall budget: report now instead of starting an attempt the job may not outlive.
+      projected=$(( SECONDS + next_sleep + actionlint_transfer_max_time ))
+      if (( projected > actionlint_deadline )); then
+        break
+      fi
+      sleep "$next_sleep"
+    fi
+  done
+
+  last_err="$(tr '\n' ' ' <"${tmpdir}/curl.err" 2>/dev/null | cut -c1-200 || true)"
+  rm -rf "$tmpdir"
+  attempts_word='attempts'
+  if [[ "$attempt" == '1' ]]; then attempts_word='attempt'; fi
+  printf 'ERROR: actionlint download failed after %s %s (url=%s http_code=%s curl_exit=%s body=%s err=%s)\n' \
+    "$attempt" "$attempts_word" "$url" "$last_http_code" "$last_curl_rc" "${body_problem:-n/a}" "$last_err" >&2
+  return 1
+}
+
+main "$@"
