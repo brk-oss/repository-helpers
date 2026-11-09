@@ -333,6 +333,13 @@ wait_timeout_error() {
   log "ERROR: WAIT_TIMEOUT $*"
 }
 
+merge_queue_removed_error() {
+  # One machine-parseable line when GitHub drops a PR from the merge queue while we wait for it to merge.
+  # Example: "ERROR: MERGE_QUEUE_REMOVED pr=#123 repo=the-hcma/foo reason=failed_checks reenqueued=1"
+  record_first_failure "MERGE_QUEUE_REMOVED $*"
+  log "ERROR: MERGE_QUEUE_REMOVED $*"
+}
+
 # Commit in the worktree, inheriting the signing config (gpg/ssh) from the
 # source repo's effective config.  Without this, commits made in the worktree
 # may be unsigned even when the user has commit.gpgsign=true in their repo or
@@ -821,6 +828,31 @@ gh_pr_merged_for_number() {
 
   raw="$(dep_runner_gh_api_jq "gh pr merged check" --probe \
     "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" '(.merged_at != null)' || true)"
+  printf '%s' "${raw:-}"
+}
+
+# Prints "<id of the latest removal>|<its reason>" for the PR: the latest time GitHub removed it from the
+# merge queue and why (failed_checks, merge_conflict, ...), or "none|" when it never was. A caller compares
+# the id with the one it saw before, so a newer removal is noticed however many earlier ones there are (a
+# count would stop growing once the page of 50 events is full). Empty output when the lookup fails, so a
+# caller never mistakes an API blip for a removal. Only the filtered timeline nodes are read (totalCount
+# counts every timeline item, whatever itemTypes says), and the removal GitHub records when the PR merges
+# (reason "merged") is not a removal.
+gh_pr_merge_queue_removals() {
+  local -r pr_number="$1"
+  # GraphQL variables ($owner, ...) are escaped so the query stays a plain double-quoted string.
+  local -r query="query(\$owner:String!,\$name:String!,\$number:Int!){\
+repository(owner:\$owner,name:\$name){pullRequest(number:\$number){\
+timelineItems(last:50,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){\
+nodes{... on RemovedFromMergeQueueEvent{id reason}}}}}}"
+  local raw
+
+  raw="$(dep_runner_gh_stdout "gh pr merge queue removals" -- api graphql \
+    -f query="$query" \
+    -f owner="$repo_owner" -f name="$repo_name" -F number="$pr_number" \
+    --jq '[.data.repository.pullRequest.timelineItems.nodes[] | select(.reason != null and .reason != "merged")]
+      | "\(.[-1].id // "none")|\(.[-1].reason // "")"' \
+    2>/dev/null || true)"
   printf '%s' "${raw:-}"
 }
 
@@ -9559,6 +9591,7 @@ cleanup_on_error() {
   case "$reason" in
     *'gh merge failed'*|*'Auto merge is not allowed'*|*'enablePullRequestAutoMerge'*|\
     *'CI not ready'*|*'refusing gh merge'*|*'is not CI-green'*|WAIT_TIMEOUT*|*'WAIT_TIMEOUT '*|\
+    MERGE_QUEUE_REMOVED*|*'MERGE_QUEUE_REMOVED '*|\
     *'preserving existing worktree'*|*'No space left on device'*)
       leave_prs_open=1
       ;;
@@ -9638,12 +9671,38 @@ cleanup() {
   log "Cleanup complete."
 }
 
+# Wall-clock seconds since epoch for merge-wait deadlines. Thin wrapper over time_log_now_utc_epoch so
+# hermetic tests can stub the clock without replacing the shared time-log helper.
+dep_updater_now_epoch() {
+  time_log_now_utc_epoch
+}
+
+# Enable auto-merge again after the merge queue dropped the PR. Returns gh's exit status and never dies, so
+# the caller can report one MERGE_QUEUE_REMOVED line instead of an unrelated gh error. It goes through the
+# shared rate-limit executor (pacing, backoff, a timeout on every attempt) so a stalled or rate-limited call
+# cannot hang the merge wait; enabling auto-merge twice is harmless, so a retry is safe.
+dep_updater_reenqueue_auto_merge() {
+  local -r pr_number="$1"
+  local out rc=0
+
+  out="$(github_api_exec_with_rate_limit_retry "gh pr merge re-enqueue" -- gh pr merge "$pr_number" \
+    --repo "${repo_owner}/${repo_name}" \
+    --auto --squash 2>&1)" || rc=$?
+  if [[ -n "$out" ]]; then
+    log "$out"
+  fi
+  return "$rc"
+}
+
 merge_pr_via_gh_single() {
   local -r pr_num="$1"
   local -r timeout_min="${merge_timeout_min}"
   local -r poll_sec=10
+  local -r queue_check_sec=30
   local merged ci_status merge_out merge_exit elapsed elapsed_fmt
   local merge_branch merge_head
+  local queue_info removal_id_before removal_id_now removal_reason reenqueued
+  local start_epoch deadline now_epoch last_queue_check
 
   merged="$(gh_pr_merged_for_number "$pr_num")"
   if [[ "$merged" == 'true' ]]; then
@@ -9674,6 +9733,17 @@ merge_pr_via_gh_single() {
   # cleanup workflows. Keep in sync with dep_enqueue_pr_for_merge_queue
   # (--auto --squash only). Org default is GitHub MQ (issue #466) — never
   # enqueue via leftover merge-it labels.
+  # Remember the latest merge-queue removal that already exists ("none" when there is none), so only a removal
+  # that happens after this enqueue (a failed merge-group run, a conflict) ends the wait below.
+  # A failed lookup leaves the baseline unknown (empty): treating it as "none" would turn an old removal from
+  # an earlier run into a "new" one at the first successful check, which adopts what it sees instead.
+  queue_info="$(gh_pr_merge_queue_removals "$pr_num")"
+  removal_id_before=''
+  if [[ "$queue_info" == *'|'* ]]; then
+    removal_id_before="${queue_info%%|*}"
+  fi
+  reenqueued=0
+
   log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
   merge_out=""
   merge_exit=0
@@ -9687,17 +9757,81 @@ merge_pr_via_gh_single() {
     log "$merge_out"
   fi
 
-  elapsed=0
-  while (( elapsed < timeout_min * 60 )); do
+  # Wall-clock deadline so slow/rate-limited queue lookups count against --merge-timeout (they used to
+  # only add the sleep interval, which under-reported waited= and could run past the budget).
+  start_epoch="$(dep_updater_now_epoch)"
+  deadline=$(( start_epoch + timeout_min * 60 ))
+  last_queue_check=$start_epoch
+  while true; do
+    now_epoch="$(dep_updater_now_epoch)"
+    if (( now_epoch >= deadline )); then
+      break
+    fi
     merged="$(gh_pr_merged_for_number "$pr_num")"
     if [[ "$merged" == 'true' ]]; then
       log "PR #${pr_num} merged."
       return 0
     fi
+    # GitHub can drop a healthy PR from the merge queue when the queue's own CI run fails (a flaky test, a
+    # download outage). Without this check the wait would run out its whole timeout and report nothing useful.
+    if (( now_epoch - last_queue_check >= queue_check_sec )); then
+      last_queue_check=$now_epoch
+      queue_info="$(gh_pr_merge_queue_removals "$pr_num")"
+      removal_id_now=''
+      removal_reason="${queue_info#*|}"
+      if [[ "$queue_info" == *'|'* ]]; then
+        removal_id_now="${queue_info%%|*}"
+      fi
+      if [[ -z "$removal_id_now" ]]; then
+        : # The lookup failed: there is nothing to compare, so keep waiting.
+      elif [[ -z "$removal_id_before" ]]; then
+        removal_id_before="$removal_id_now"
+      elif [[ "$removal_id_now" != "$removal_id_before" ]]; then
+        if [[ "$removal_reason" == 'failed_checks' && "$reenqueued" == '0' ]]; then
+          log "NOTE: MERGE_QUEUE_REENQUEUE pr=#${pr_num} repo=${repo_owner}/${repo_name} reason=${removal_reason}"
+          if dep_updater_reenqueue_auto_merge "$pr_num"; then
+            reenqueued=1
+            removal_id_before="$removal_id_now"
+          else
+            # Prefer success if the PR merged while the re-enqueue / timeline lookup ran.
+            merged="$(gh_pr_merged_for_number "$pr_num")"
+            if [[ "$merged" == 'true' ]]; then
+              log "PR #${pr_num} merged."
+              return 0
+            fi
+            merge_queue_removed_error \
+              "pr=#${pr_num} repo=${repo_owner}/${repo_name} reason=${removal_reason} reenqueued=failed"
+            return 1
+          fi
+        else
+          merged="$(gh_pr_merged_for_number "$pr_num")"
+          if [[ "$merged" == 'true' ]]; then
+            log "PR #${pr_num} merged."
+            return 0
+          fi
+          merge_queue_removed_error \
+            "pr=#${pr_num} repo=${repo_owner}/${repo_name} reason=${removal_reason:-unknown} reenqueued=${reenqueued}"
+          return 1
+        fi
+      fi
+    fi
+    # A slow/rate-limited queue lookup may already have spent the remaining budget; do not sleep past it.
+    now_epoch="$(dep_updater_now_epoch)"
+    if (( now_epoch >= deadline )); then
+      break
+    fi
     sleep "$poll_sec"
-    elapsed=$(( elapsed + poll_sec ))
   done
 
+  # A slow queue lookup can exhaust the deadline after the PR has already merged; prefer success.
+  merged="$(gh_pr_merged_for_number "$pr_num")"
+  if [[ "$merged" == 'true' ]]; then
+    log "PR #${pr_num} merged."
+    return 0
+  fi
+
+  now_epoch="$(dep_updater_now_epoch)"
+  elapsed=$(( now_epoch - start_epoch ))
   if (( elapsed < 60 )); then
     elapsed_fmt="${elapsed}s"
   else
@@ -10231,7 +10365,7 @@ batch_all_scrape_actionable_from_log() {
   local -r log_file="$1"
   local line stripped
 
-  line="$(grep -E 'ERROR: WAIT_TIMEOUT ' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  line="$(grep -E 'ERROR: (WAIT_TIMEOUT|MERGE_QUEUE_REMOVED) ' "$log_file" 2>/dev/null | tail -n 1 || true)"
   if [[ -n "$line" ]]; then
     stripped="${line#*ERROR: }"
     printf '%s' "$stripped"
